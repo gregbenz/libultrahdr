@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include "ultrahdr/gainmapmath.h"
 #include "ultrahdr/gainmapmetadata.h"
@@ -77,23 +78,16 @@ uhdr_error_info_t streamReadU32(const std::vector<uint8_t> &data, uint32_t &valu
              (int)data.size());
     return status;
   }
-  value = (data[pos] << 24 | data[pos + 1] << 16 | data[pos + 2] << 8 | data[pos + 3]);
+  value = (static_cast<uint32_t>(data[pos]) << 24 | static_cast<uint32_t>(data[pos + 1]) << 16 |
+           static_cast<uint32_t>(data[pos + 2]) << 8 | static_cast<uint32_t>(data[pos + 3]));
   pos += 4;
   return g_no_error;
 }
 
 uhdr_error_info_t streamReadS32(const std::vector<uint8_t> &data, int32_t &value, size_t &pos) {
-  if (pos > data.size() || data.size() - pos < 4) {
-    uhdr_error_info_t status;
-    status.error_code = UHDR_CODEC_MEM_ERROR;
-    status.has_detail = 1;
-    snprintf(status.detail, sizeof status.detail,
-             "attempting to read 4 bytes from position %d when the buffer size is %d", (int)pos,
-             (int)data.size());
-    return status;
-  }
-  value = (data[pos] << 24 | data[pos + 1] << 16 | data[pos + 2] << 8 | data[pos + 3]);
-  pos += 4;
+  uint32_t unsigned_value;
+  UHDR_ERR_CHECK(streamReadU32(data, unsigned_value, pos))
+  memcpy(&value, &unsigned_value, sizeof(value));
   return g_no_error;
 }
 

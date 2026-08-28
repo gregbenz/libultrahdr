@@ -9,6 +9,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "ultrahdr/gainmapmetadata.h"
@@ -34,6 +36,22 @@ void GainMapMetadataTest::SetUp() {}
 void GainMapMetadataTest::TearDown() {}
 
 const std::string kIso = "urn:iso:std:iso:ts:21496:-1";
+
+namespace {
+
+void appendU16(std::vector<uint8_t>& data, uint16_t value) {
+  data.push_back((value >> 8) & 0xff);
+  data.push_back(value & 0xff);
+}
+
+void appendU32(std::vector<uint8_t>& data, uint32_t value) {
+  data.push_back((value >> 24) & 0xff);
+  data.push_back((value >> 16) & 0xff);
+  data.push_back((value >> 8) & 0xff);
+  data.push_back(value & 0xff);
+}
+
+}  // namespace
 
 TEST_F(GainMapMetadataTest, encodeMetadataThenDecode) {
   uhdr_gainmap_metadata_ext_t expected("1.0");
@@ -145,6 +163,30 @@ TEST(GainmapMetadataTest, RejectsMalformedISO21496_1Ratios) {
   frac.baseHdrHeadroomN = 1;      // log2(headroom_min) = 1 -> 2.0
   EXPECT_EQ(uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(&frac, &float_meta).error_code,
             UHDR_CODEC_INVALID_PARAM);
+}
+
+TEST_F(GainMapMetadataTest, decodeHandlesHighBitIntegerFields) {
+  std::vector<uint8_t> data;
+  appendU16(data, 0);                          // minimum version
+  appendU16(data, 0);                          // writer version
+  data.push_back(kUseBaseColorSpaceMask | 8);  // single channel, common denominator
+  appendU32(data, 1);                          // common denominator
+  appendU32(data, 0);                          // base HDR headroom numerator
+  appendU32(data, 1);                          // alternate HDR headroom numerator
+  appendU32(data, 0x80000000u);                // gainMapMin numerator
+  appendU32(data, 0xffffffffu);                // gainMapMax numerator
+  appendU32(data, 0x80000000u);                // gainMapGamma numerator
+  appendU32(data, 0xffffffffu);                // baseOffset numerator
+  appendU32(data, 0x80000000u);                // alternateOffset numerator
+
+  uhdr_gainmap_metadata_frac decoded_metadata;
+  ASSERT_EQ(uhdr_gainmap_metadata_frac::decodeGainmapMetadata(data, &decoded_metadata).error_code,
+            UHDR_CODEC_OK);
+  EXPECT_EQ(decoded_metadata.gainMapMinN[0], std::numeric_limits<int32_t>::min());
+  EXPECT_EQ(decoded_metadata.gainMapMaxN[0], -1);
+  EXPECT_EQ(decoded_metadata.gainMapGammaN[0], 0x80000000u);
+  EXPECT_EQ(decoded_metadata.baseOffsetN[0], -1);
+  EXPECT_EQ(decoded_metadata.alternateOffsetN[0], std::numeric_limits<int32_t>::min());
 }
 
 }  // namespace ultrahdr
