@@ -616,6 +616,7 @@ UHDR_EXTERN void uhdr_reset_encoder(uhdr_codec_private_t* enc);
  *          image or gainmap image or gainmap metadata
  *
  * This is a structural check and does not guarantee that the current runtime can decode the image.
+ * The legacy implementation retains its historical decoder-probe behavior.
  */
 UHDR_EXTERN int is_uhdr_image(void* data, int size);
 
@@ -623,17 +624,22 @@ UHDR_EXTERN int is_uhdr_image(void* data, int size);
  *
  * This function validates the gain-map structure and metadata without decoding pixels. For
  * HEIF/AVIF inputs, the current runtime-support policy is conservative: the primary and gain-map
- * items must each be directly coded as AV1 (av01) or HEVC (hvc1/hev1), without alpha channels or
- * derived-image layouts, and must use dimensions and color layouts supported by libultrahdr. The
- * decoder families required by both items must also be currently available. Other structurally
- * valid HEIF/AVIF gain-map structures may return 0. A positive result is a routing hint, not a
- * guarantee that the compressed payload is complete or that every payload or codec profile will
- * decode successfully.
+ * items must each be directly coded as AV1 (av01) or HEVC (hvc1/hev1), and any directly associated
+ * alpha dependency must also be directly coded and use a supported color layout (including
+ * monochrome for alpha). Derived-image layouts, unresolved dependencies, and nested alpha
+ * dependencies are rejected. The primary and gain-map items must use dimensions and color layouts
+ * supported by libultrahdr. Their required decoder families must all be available. Other
+ * structurally valid HEIF/AVIF gain-map structures may return 0. If the build lacks libheif item
+ * inspection, this function returns 0 for HEIF/AVIF; existing encode/decode APIs and JPEG routing
+ * remain available. A positive result is a routing hint, not a guarantee that the compressed
+ * payload is complete or that every payload or codec profile will decode successfully.
  *
  * Because this function includes runtime and layout checks, a structurally recognized image may
  * return 1 from is_uhdr_image() but 0 here.
- * JPEG validation covers the MPF fields needed to associate the exact secondary image; unrelated
- * primary-image size bookkeeping is tolerated for compatibility with existing Apple-authored files.
+ * This function is the strict MPF validator for JPEG routing and covers the fields needed to
+ * associate the exact secondary image; unrelated primary-image size bookkeeping is tolerated for
+ * compatibility with existing Apple-authored files. The legacy is_uhdr_image() probe is not
+ * replaced by this stricter MPF validation.
  *
  * The input buffer is borrowed for the duration of the call and is not modified or retained. The
  * complete encoded stream and embedded JPEG payloads are not duplicated; parsers may allocate

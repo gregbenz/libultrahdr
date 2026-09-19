@@ -212,6 +212,17 @@ static bool insertDuplicateMpfTag(std::vector<uint8_t>& data, uint16_t tag_id) {
 }
 
 #if defined(UHDR_ENABLE_HEIF)
+static void expectSupportedHeifGainmap(const void* data, size_t size, bool decoder_available) {
+#if defined(UHDR_HAS_HEIF_ITEM_API)
+  EXPECT_EQ(uhdr_is_supported_gainmap_image(data, size), decoder_available ? 1 : 0);
+#else
+  // The legacy HEIF gain-map APIs keep encode/decode coverage available, but routing requires
+  // the optional item-inspection API. The documented fallback is an unsupported routing result.
+  EXPECT_EQ(uhdr_is_supported_gainmap_image(data, size), 0);
+  (void)decoder_available;
+#endif
+}
+
 static heif_error writeHeifToVector([[maybe_unused]] heif_context* context, const void* data,
                                     size_t size, void* userdata) {
   auto* output = static_cast<std::vector<uint8_t>*>(userdata);
@@ -444,8 +455,10 @@ TEST_F(UltraHdrApiTest, JpegEncodeApi0AndDecode) {
                                 locations.big_endian, &secondary_offset));
   writeMpfU32ForTest(broken_association, locations.secondary_offset, locations.big_endian,
                      secondary_offset + 1);
+  // is_uhdr_image() retains its historical decoder-probe behavior. The stricter MPF association
+  // check belongs to the new routing predicate.
   EXPECT_EQ(is_uhdr_image(broken_association.data(), static_cast<int>(broken_association.size())),
-            0);
+            1);
   EXPECT_EQ(uhdr_is_supported_gainmap_image(broken_association.data(), broken_association.size()),
             0);
 
@@ -453,7 +466,7 @@ TEST_F(UltraHdrApiTest, JpegEncodeApi0AndDecode) {
                                        static_cast<uint8_t*>(output->data) + output->data_sz);
   ASSERT_TRUE(findMpfEntryLocations(malformed_table, &locations));
   writeMpfU32ForTest(malformed_table, locations.count, locations.big_endian, 0xffffffffu);
-  EXPECT_EQ(is_uhdr_image(malformed_table.data(), static_cast<int>(malformed_table.size())), 0);
+  EXPECT_EQ(is_uhdr_image(malformed_table.data(), static_cast<int>(malformed_table.size())), 1);
   EXPECT_EQ(uhdr_is_supported_gainmap_image(malformed_table.data(), malformed_table.size()), 0);
 
   std::vector<uint8_t> displaced_signature(static_cast<uint8_t*>(output->data),
@@ -470,7 +483,7 @@ TEST_F(UltraHdrApiTest, JpegEncodeApi0AndDecode) {
   displaced_signature[displaced_mpf_offset + 2] = 'F';
   writeMpfU16ForTest(displaced_signature, locations.signature - 2, true, app2_length + 4);
   EXPECT_EQ(is_uhdr_image(displaced_signature.data(), static_cast<int>(displaced_signature.size())),
-            0);
+            1);
   EXPECT_EQ(
       uhdr_is_supported_gainmap_image(displaced_signature.data(), displaced_signature.size()), 0);
 
@@ -481,7 +494,7 @@ TEST_F(UltraHdrApiTest, JpegEncodeApi0AndDecode) {
     ASSERT_TRUE(insertDuplicateMpfTag(duplicate_mandatory_tag, duplicate_tag));
     EXPECT_EQ(is_uhdr_image(duplicate_mandatory_tag.data(),
                             static_cast<int>(duplicate_mandatory_tag.size())),
-              0);
+              1);
     EXPECT_EQ(uhdr_is_supported_gainmap_image(duplicate_mandatory_tag.data(),
                                               duplicate_mandatory_tag.size()),
               0);
@@ -506,7 +519,7 @@ TEST_F(UltraHdrApiTest, JpegEncodeApi0AndDecode) {
       writeMpfU32ForTest(malformed_version, mutation.offset, locations.big_endian, 0);
     }
     EXPECT_EQ(is_uhdr_image(malformed_version.data(), static_cast<int>(malformed_version.size())),
-              0);
+              1);
     EXPECT_EQ(uhdr_is_supported_gainmap_image(malformed_version.data(), malformed_version.size()),
               0);
   }
@@ -517,7 +530,7 @@ TEST_F(UltraHdrApiTest, JpegEncodeApi0AndDecode) {
                                          static_cast<uint8_t*>(output->data) + output->data_sz);
     ASSERT_TRUE(findMpfEntryLocations(malformed_entry, &locations));
     writeMpfU32ForTest(malformed_entry, invalid_field, locations.big_endian, 1);
-    EXPECT_EQ(is_uhdr_image(malformed_entry.data(), static_cast<int>(malformed_entry.size())), 0);
+    EXPECT_EQ(is_uhdr_image(malformed_entry.data(), static_cast<int>(malformed_entry.size())), 1);
     EXPECT_EQ(uhdr_is_supported_gainmap_image(malformed_entry.data(), malformed_entry.size()), 0);
   }
 
@@ -643,8 +656,7 @@ TEST_F(UltraHdrApiTest, RoutingProbeReflectsHevcDecoderAvailability) {
 
   EXPECT_EQ(is_uhdr_image(hevc_gainmap.data(), static_cast<int>(hevc_gainmap.size())), 1);
   const bool have_hevc_decoder = heif_have_decoder_for_format(heif_compression_HEVC);
-  EXPECT_EQ(uhdr_is_supported_gainmap_image(hevc_gainmap.data(), hevc_gainmap.size()),
-            have_hevc_decoder ? 1 : 0);
+  expectSupportedHeifGainmap(hevc_gainmap.data(), hevc_gainmap.size(), have_hevc_decoder);
 
   if (have_hevc_decoder) {
     uhdr_compressed_image_t input{};
@@ -666,7 +678,7 @@ TEST_F(UltraHdrApiTest, RoutingProbeReflectsHevcDecoderAvailability) {
   }
 }
 
-TEST_F(UltraHdrApiTest, RoutingProbeRejectsOrdinaryAvif) {
+TEST_F(UltraHdrApiTest, RoutingProbeRejectsOrdinaryAvifButLegacyPredicateRemainsCompatible) {
   if (!heif_have_encoder_for_format(heif_compression_AV1)) {
     GTEST_SKIP() << "AV1 encoder plugin not available in environment";
   }
@@ -674,8 +686,10 @@ TEST_F(UltraHdrApiTest, RoutingProbeRejectsOrdinaryAvif) {
   ASSERT_TRUE(encodeOrdinaryAvif(ordinary_avif));
   ASSERT_FALSE(ordinary_avif.empty());
 
-  EXPECT_EQ(is_uhdr_image(ordinary_avif.data(), static_cast<int>(ordinary_avif.size())), 0);
-  EXPECT_EQ(uhdr_is_supported_gainmap_image(ordinary_avif.data(), ordinary_avif.size()), 0);
+  // The historical decoder-probe implementation returns 1 for a parseable HEIF/AVIF container
+  // even when it has no gain map. Keep that compatibility behavior explicit here.
+  EXPECT_EQ(is_uhdr_image(ordinary_avif.data(), static_cast<int>(ordinary_avif.size())), 1);
+  expectSupportedHeifGainmap(ordinary_avif.data(), ordinary_avif.size(), false);
 }
 
 namespace {
@@ -894,7 +908,8 @@ TEST_F(UltraHdrApiTest, HeicEncodeApi0AndDecode) {
   ASSERT_GT(output->data_sz, 0u);
 
   EXPECT_EQ(is_uhdr_image(output->data, static_cast<int>(output->data_sz)), 1);
-  EXPECT_EQ(uhdr_is_supported_gainmap_image(output->data, output->data_sz), 1);
+  expectSupportedHeifGainmap(output->data, output->data_sz,
+                             heif_have_decoder_for_format(heif_compression_HEVC));
 
   // Decode HEIC stream
   uhdr_codec_private_t* dec = uhdr_create_decoder();
@@ -964,7 +979,8 @@ TEST_F(UltraHdrApiTest, HeicEncodeApi1AndDecode) {
   ASSERT_GT(output->data_sz, 0u);
   EXPECT_EQ(getPrimaryImageTransfer(output), heif_transfer_characteristic_IEC_61966_2_1);
   EXPECT_EQ(is_uhdr_image(output->data, static_cast<int>(output->data_sz)), 1);
-  EXPECT_EQ(uhdr_is_supported_gainmap_image(output->data, output->data_sz), 1);
+  expectSupportedHeifGainmap(output->data, output->data_sz,
+                             heif_have_decoder_for_format(heif_compression_HEVC));
 
   uhdr_codec_private_t* dec = uhdr_create_decoder();
   ASSERT_NE(dec, nullptr);
@@ -1040,7 +1056,8 @@ TEST_F(UltraHdrApiTest, AvifEncodeApi0AndDecode) {
   ASSERT_GT(output->data_sz, 0u);
 
   EXPECT_EQ(is_uhdr_image(output->data, static_cast<int>(output->data_sz)), 1);
-  EXPECT_EQ(uhdr_is_supported_gainmap_image(output->data, output->data_sz), 1);
+  expectSupportedHeifGainmap(output->data, output->data_sz,
+                             heif_have_decoder_for_format(heif_compression_AV1));
 
   // Decode AVIF stream
   uhdr_codec_private_t* dec = uhdr_create_decoder();
@@ -1105,6 +1122,9 @@ TEST_F(UltraHdrApiTest, AvifEncodeApi1AndDecode) {
   ASSERT_NE(output, nullptr);
   ASSERT_GT(output->data_sz, 0u);
   EXPECT_EQ(getPrimaryImageTransfer(output), heif_transfer_characteristic_IEC_61966_2_1);
+  EXPECT_EQ(is_uhdr_image(output->data, static_cast<int>(output->data_sz)), 1);
+  expectSupportedHeifGainmap(output->data, output->data_sz,
+                             heif_have_decoder_for_format(heif_compression_AV1));
 
   uhdr_codec_private_t* dec = uhdr_create_decoder();
   ASSERT_NE(dec, nullptr);
@@ -1331,6 +1351,12 @@ TEST_F(UltraHdrApiTest, AvifPreservesRawAlpha) {
     GTEST_SKIP() << "AV1 encoder plugin not available in environment: " << status.detail;
   }
   ASSERT_EQ(status.error_code, UHDR_CODEC_OK) << (status.has_detail ? status.detail : "no detail");
+  // This fixture has straight alpha on the primary AVIF item. Its gain-map item is ordinary
+  // monochrome and is not alpha-bearing. When item inspection is available, the routing assertion
+  // covers the primary-alpha form; the helper below also performs a real SDR decode to RGBA.
+  EXPECT_EQ(is_uhdr_image(encoded.data(), static_cast<int>(encoded.size())), 1);
+  expectSupportedHeifGainmap(encoded.data(), encoded.size(),
+                             heif_have_decoder_for_format(heif_compression_AV1));
   EXPECT_TRUE(decodedAlphaMatches(encoded));
   expectRawAlphaPreserved(UHDR_CODEC_AVIF, &images.hdrHalfFloatDesc);
   images.makeHdr1010102AlphaOpaque();
@@ -1346,6 +1372,9 @@ TEST_F(UltraHdrApiTest, HeifPreservesRawAlpha) {
     GTEST_SKIP() << "HEVC encoder plugin not available in environment: " << status.detail;
   }
   ASSERT_EQ(status.error_code, UHDR_CODEC_OK) << (status.has_detail ? status.detail : "no detail");
+  EXPECT_EQ(is_uhdr_image(encoded.data(), static_cast<int>(encoded.size())), 1);
+  expectSupportedHeifGainmap(encoded.data(), encoded.size(),
+                             heif_have_decoder_for_format(heif_compression_HEVC));
   EXPECT_TRUE(decodedAlphaMatches(encoded));
   expectRawAlphaPreserved(UHDR_CODEC_HEIF, &images.hdrHalfFloatDesc);
   images.makeHdr1010102AlphaOpaque();

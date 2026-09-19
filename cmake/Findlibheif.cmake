@@ -14,6 +14,7 @@
 #   LIBHEIF_LIBRARIES         - Libraries needed to link against libheif
 
 include(CheckCXXSymbolExists)
+include(CheckCXXSourceCompiles)
 include(FindPackageHandleStandardArgs)
 
 set(LIBHEIF_TARGET "")
@@ -106,9 +107,30 @@ if(LIBHEIF_TARGET)
     "libheif/heif.h"
     LIBHEIF_HAS_GAIN_MAP
   )
-  check_cxx_symbol_exists(
-    heif_item_get_item_type
-    "libheif/heif_items.h"
+  check_cxx_source_compiles(
+    [=[
+#include "libheif/heif.h"
+#include "libheif/heif_items.h"
+
+int main() {
+  const heif_context* context = nullptr;
+  const heif_image_handle* handle = nullptr;
+  const heif_item_id item_id = heif_image_handle_get_item_id(handle);
+  const uint32_t item_type = heif_item_get_item_type(context, item_id);
+  const int aux_filter = 0;
+  heif_item_id auxiliary_ids[1] = {};
+  heif_image_handle* auxiliary_handle = nullptr;
+  const char* auxiliary_type = nullptr;
+
+  (void)heif_image_handle_get_number_of_auxiliary_images(handle, aux_filter);
+  (void)heif_image_handle_get_list_of_auxiliary_image_IDs(handle, aux_filter, auxiliary_ids, 1);
+  (void)heif_image_handle_get_auxiliary_type(handle, &auxiliary_type);
+  (void)heif_image_handle_release_auxiliary_type(handle, &auxiliary_type);
+  (void)heif_image_handle_get_auxiliary_image_handle(handle, item_id, &auxiliary_handle);
+  (void)item_type;
+  return 0;
+}
+]=]
     LIBHEIF_HAS_ITEM_API
   )
 
