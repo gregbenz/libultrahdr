@@ -19,6 +19,7 @@
 #include "ultrahdr/ultrahdrcommon.h"
 #include "ultrahdr/jpegr.h"
 #include "ultrahdr/gainmapmath.h"
+#include "ultrahdr/gainmapmetadata.h"
 #include "ultrahdr/heifultrahdr.h"
 #include "ultrahdr/avifultrahdr.h"
 #if defined(UHDR_ENABLE_HEIF)
@@ -273,6 +274,151 @@ cleanup:
   if (image != nullptr) heif_image_release(image);
   heif_context_free(context);
   return success;
+}
+
+using HeifContextPtr = std::unique_ptr<heif_context, decltype(&heif_context_free)>;
+using HeifEncoderPtr = std::unique_ptr<heif_encoder, decltype(&heif_encoder_release)>;
+using HeifImagePtr = std::unique_ptr<heif_image, decltype(&heif_image_release)>;
+using HeifHandlePtr =
+    std::unique_ptr<heif_image_handle, decltype(&heif_image_handle_release)>;
+using HeifOptionsPtr =
+    std::unique_ptr<heif_encoding_options, decltype(&heif_encoding_options_free)>;
+using HeifProfilePtr =
+    std::unique_ptr<heif_color_profile_nclx, decltype(&heif_nclx_color_profile_free)>;
+
+static bool fillHeifPlane(heif_image* image, heif_channel channel, int width, int height,
+                          uint8_t value) {
+  int stride = 0;
+  uint8_t* plane = heif_image_get_plane(image, channel, &stride);
+  if (plane == nullptr || stride < width) return false;
+  for (int y = 0; y < height; ++y) {
+    std::fill(plane + y * stride, plane + y * stride + width, value);
+  }
+  return true;
+}
+
+static HeifProfilePtr makeNclxProfile(uint16_t primaries, uint16_t transfer, uint16_t matrix) {
+  HeifProfilePtr profile(heif_nclx_color_profile_alloc(), heif_nclx_color_profile_free);
+  if (profile == nullptr ||
+      heif_nclx_color_profile_set_color_primaries(profile.get(), primaries).code !=
+          heif_error_Ok ||
+      heif_nclx_color_profile_set_transfer_characteristics(profile.get(), transfer).code !=
+          heif_error_Ok ||
+      heif_nclx_color_profile_set_matrix_coefficients(profile.get(), matrix).code !=
+          heif_error_Ok) {
+    return HeifProfilePtr(nullptr, heif_nclx_color_profile_free);
+  }
+  profile->full_range_flag = 1;
+  return profile;
+}
+
+static bool encodeGainmapSideAlphaAvif(std::vector<uint8_t>& output) {
+  constexpr int base_width = 64;
+  constexpr int base_height = 64;
+  constexpr int gainmap_width = 32;
+  constexpr int gainmap_height = 32;
+
+  HeifContextPtr context(heif_context_alloc(), heif_context_free);
+  if (context == nullptr) return false;
+
+  heif_image* base_raw = nullptr;
+  if (heif_image_create(base_width, base_height, heif_colorspace_YCbCr, heif_chroma_420,
+                        &base_raw)
+              .code != heif_error_Ok) {
+    return false;
+  }
+  HeifImagePtr base(base_raw, heif_image_release);
+  if (heif_image_add_plane(base.get(), heif_channel_Y, base_width, base_height, 8).code !=
+          heif_error_Ok ||
+      heif_image_add_plane(base.get(), heif_channel_Cb, base_width / 2, base_height / 2, 8)
+              .code != heif_error_Ok ||
+      heif_image_add_plane(base.get(), heif_channel_Cr, base_width / 2, base_height / 2, 8)
+              .code != heif_error_Ok ||
+      !fillHeifPlane(base.get(), heif_channel_Y, base_width, base_height, 128) ||
+      !fillHeifPlane(base.get(), heif_channel_Cb, base_width / 2, base_height / 2, 128) ||
+      !fillHeifPlane(base.get(), heif_channel_Cr, base_width / 2, base_height / 2, 128)) {
+    return false;
+  }
+
+  heif_image* gainmap_raw = nullptr;
+  if (heif_image_create(gainmap_width, gainmap_height, heif_colorspace_monochrome,
+                        heif_chroma_monochrome, &gainmap_raw)
+              .code != heif_error_Ok) {
+    return false;
+  }
+  HeifImagePtr gainmap(gainmap_raw, heif_image_release);
+  if (heif_image_add_plane(gainmap.get(), heif_channel_Y, gainmap_width, gainmap_height, 8)
+              .code != heif_error_Ok ||
+      heif_image_add_plane(gainmap.get(), heif_channel_Alpha, gainmap_width, gainmap_height, 8)
+              .code != heif_error_Ok ||
+      !fillHeifPlane(gainmap.get(), heif_channel_Y, gainmap_width, gainmap_height, 96) ||
+      !fillHeifPlane(gainmap.get(), heif_channel_Alpha, gainmap_width, gainmap_height, 128)) {
+    return false;
+  }
+  heif_image_set_premultiplied_alpha(gainmap.get(), 0);
+
+  HeifProfilePtr base_profile =
+      makeNclxProfile(heif_color_primaries_ITU_R_BT_709_5,
+                      heif_transfer_characteristic_ITU_R_BT_709_5,
+                      heif_matrix_coefficients_ITU_R_BT_709_5);
+  HeifProfilePtr gainmap_profile =
+      makeNclxProfile(heif_color_primaries_unspecified, heif_transfer_characteristic_unspecified,
+                      heif_matrix_coefficients_ITU_R_BT_601_6);
+  HeifProfilePtr derived_profile =
+      makeNclxProfile(heif_color_primaries_ITU_R_BT_2020_2_and_2100_0,
+                      heif_transfer_characteristic_ITU_R_BT_2100_0_HLG,
+                      heif_matrix_coefficients_ITU_R_BT_2020_2_non_constant_luminance);
+  if (base_profile == nullptr || gainmap_profile == nullptr || derived_profile == nullptr ||
+      heif_image_set_nclx_color_profile(base.get(), base_profile.get()).code != heif_error_Ok ||
+      heif_image_set_nclx_color_profile(gainmap.get(), gainmap_profile.get()).code !=
+          heif_error_Ok) {
+    return false;
+  }
+
+  heif_encoder* encoder_raw = nullptr;
+  if (heif_context_get_encoder_for_format(context.get(), heif_compression_AV1, &encoder_raw)
+              .code != heif_error_Ok) {
+    return false;
+  }
+  HeifEncoderPtr encoder(encoder_raw, heif_encoder_release);
+  if (heif_encoder_set_lossy_quality(encoder.get(), 100).code != heif_error_Ok) return false;
+
+  HeifOptionsPtr options(heif_encoding_options_alloc(), heif_encoding_options_free);
+  if (options == nullptr) return false;
+  options->save_alpha_channel = 1;
+  options->output_nclx_profile = base_profile.get();
+
+  heif_image_handle* base_handle_raw = nullptr;
+  if (heif_context_encode_image(context.get(), base.get(), encoder.get(), options.get(),
+                                &base_handle_raw)
+              .code != heif_error_Ok) {
+    return false;
+  }
+  HeifHandlePtr base_handle(base_handle_raw, heif_image_handle_release);
+
+  uhdr_gainmap_metadata_frac metadata;
+  metadata.alternateHdrHeadroomN = 2;
+  std::vector<uint8_t> iso_metadata;
+  if (uhdr_gainmap_metadata_frac::encodeGainmapMetadata(&metadata, iso_metadata).error_code !=
+      UHDR_CODEC_OK) {
+    return false;
+  }
+
+  options->output_nclx_profile = gainmap_profile.get();
+  if (heif_encoder_set_lossy_quality(encoder.get(), 100).code != heif_error_Ok) return false;
+  heif_image_handle* gainmap_handle_raw = nullptr;
+  if (heif_context_encode_gain_map_image(
+          context.get(), base_handle.get(), encoder.get(), gainmap.get(), options.get(),
+          iso_metadata.data(), static_cast<int>(iso_metadata.size()), derived_profile.get(),
+          &gainmap_handle_raw)
+          .code != heif_error_Ok) {
+    return false;
+  }
+  HeifHandlePtr gainmap_handle(gainmap_handle_raw, heif_image_handle_release);
+
+  heif_writer writer{1, writeHeifToVector};
+  return heif_context_write(context.get(), &writer, &output).code == heif_error_Ok &&
+         !output.empty();
 }
 #endif
 
@@ -690,6 +836,40 @@ TEST_F(UltraHdrApiTest, RoutingProbeRejectsOrdinaryAvifButLegacyPredicateRemains
   // even when it has no gain map. Keep that compatibility behavior explicit here.
   EXPECT_EQ(is_uhdr_image(ordinary_avif.data(), static_cast<int>(ordinary_avif.size())), 1);
   expectSupportedHeifGainmap(ordinary_avif.data(), ordinary_avif.size(), false);
+}
+
+TEST(UltraHdrRoutingTest, GainmapSideAlphaIsSupported) {
+  if (!heif_have_encoder_for_format(heif_compression_AV1)) {
+    GTEST_SKIP() << "AV1 encoder plugin not available in environment";
+  }
+
+  std::vector<uint8_t> encoded;
+  ASSERT_TRUE(encodeGainmapSideAlphaAvif(encoded));
+
+  HeifContextPtr context(heif_context_alloc(), heif_context_free);
+  ASSERT_NE(context, nullptr);
+  ASSERT_EQ(heif_context_read_from_memory_without_copy(context.get(), encoded.data(),
+                                                       encoded.size(), nullptr)
+                .code,
+            heif_error_Ok);
+
+  heif_image_handle* primary_raw = nullptr;
+  ASSERT_EQ(heif_context_get_primary_image_handle(context.get(), &primary_raw).code,
+            heif_error_Ok);
+  HeifHandlePtr primary(primary_raw, heif_image_handle_release);
+  ASSERT_NE(primary, nullptr);
+
+  heif_image_handle* gainmap_raw = nullptr;
+  ASSERT_EQ(heif_image_handle_get_gain_map_image_handle(primary.get(), &gainmap_raw).code,
+            heif_error_Ok);
+  HeifHandlePtr gainmap(gainmap_raw, heif_image_handle_release);
+  ASSERT_NE(gainmap, nullptr);
+
+  EXPECT_EQ(heif_image_handle_has_alpha_channel(primary.get()), 0);
+  EXPECT_EQ(heif_image_handle_has_alpha_channel(gainmap.get()), 1);
+  EXPECT_EQ(heif_image_handle_is_premultiplied_alpha(gainmap.get()), 0);
+  expectSupportedHeifGainmap(encoded.data(), encoded.size(),
+                             heif_have_decoder_for_format(heif_compression_AV1));
 }
 
 namespace {
