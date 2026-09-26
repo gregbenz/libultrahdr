@@ -91,7 +91,7 @@ if(LIBHEIF_TARGET)
     list(APPEND CMAKE_REQUIRED_INCLUDES ${LIBHEIF_INCLUDE_DIR})
   endif()
   if(LIBHEIF_DEFS)
-    set(CMAKE_REQUIRED_DEFINITIONS "-D${LIBHEIF_DEFS}")
+    list(TRANSFORM LIBHEIF_DEFS PREPEND "-D" OUTPUT_VARIABLE CMAKE_REQUIRED_DEFINITIONS)
   endif()
 
   # Perform a compile-only check to avoid linking transitive dependencies
