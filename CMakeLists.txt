@@ -764,27 +764,19 @@ if(UHDR_BUILD_TESTS)
 
   # The fixture configures with the host compiler; skip target toolchains such as Android.
   if(NOT CMAKE_CROSSCOMPILING)
-    set(_libheif_discovery_cmake_args
-      -G "${CMAKE_GENERATOR}"
-      "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
-    )
+    set(_libheif_discovery_cmake_args -G "${CMAKE_GENERATOR}")
     if(CMAKE_GENERATOR_PLATFORM)
       list(APPEND _libheif_discovery_cmake_args -A "${CMAKE_GENERATOR_PLATFORM}")
     endif()
     if(CMAKE_GENERATOR_TOOLSET)
       list(APPEND _libheif_discovery_cmake_args -T "${CMAKE_GENERATOR_TOOLSET}")
     endif()
-    if(CMAKE_TOOLCHAIN_FILE)
-      list(APPEND _libheif_discovery_cmake_args "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}")
-    endif()
-    if(CMAKE_OSX_ARCHITECTURES)
-      string(REPLACE ";" "\\;" _libheif_discovery_osx_architectures "${CMAKE_OSX_ARCHITECTURES}")
-      list(APPEND _libheif_discovery_cmake_args
-        "-DCMAKE_OSX_ARCHITECTURES=${_libheif_discovery_osx_architectures}")
-    endif()
-    foreach(_variable IN ITEMS CMAKE_OSX_DEPLOYMENT_TARGET CMAKE_OSX_SYSROOT)
+
+    foreach(_variable IN ITEMS CMAKE_CXX_COMPILER CMAKE_TOOLCHAIN_FILE
+        CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET CMAKE_OSX_SYSROOT)
       if(DEFINED ${_variable} AND NOT "${${_variable}}" STREQUAL "")
-        list(APPEND _libheif_discovery_cmake_args "-D${_variable}=${${_variable}}")
+        string(REPLACE ";" "\\;" _value "${${_variable}}")
+        list(APPEND _libheif_discovery_cmake_args "-D${_variable}=${_value}")
       endif()
     endforeach()
 
