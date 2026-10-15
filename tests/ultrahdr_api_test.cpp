@@ -11,12 +11,12 @@
 #include <cmath>
 #include <fstream>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <limits>
-#include <vector>
-#include <memory>
 #include <string>
 #include <vector>
-
+#include <memory>
 #include "ultrahdr_api.h"
 #include "ultrahdr/ultrahdrcommon.h"
 #include "ultrahdr/jpegr.h"
@@ -671,6 +671,103 @@ TEST_F(UltraHdrApiTest, GainmapExportFailureLeavesResultUntouched) {
   EXPECT_EQ(result.height, 19u);
 }
 
+TEST_F(UltraHdrApiTest, GainmapExportRejectsNonJpegWithoutFreezingDecoder) {
+  uint8_t sentinel = 0x5a;
+  auto makeResult = [&]() {
+    uhdr_gainmap_export_t result{};
+    result.image.data = &sentinel;
+    result.image.data_sz = 1;
+    result.image.capacity = 1;
+    result.width = 17;
+    result.height = 19;
+    result.metadata.max_content_boost[0] = 3.25f;
+    return result;
+  };
+  auto expectUnchanged = [&](const uhdr_gainmap_export_t& result) {
+    EXPECT_EQ(result.image.data, &sentinel);
+    EXPECT_EQ(result.image.data_sz, 1u);
+    EXPECT_EQ(result.image.capacity, 1u);
+    EXPECT_EQ(result.width, 17u);
+    EXPECT_EQ(result.height, 19u);
+    EXPECT_FLOAT_EQ(result.metadata.max_content_boost[0], 3.25f);
+  };
+
+  std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> no_input_decoder(
+      uhdr_create_decoder(), uhdr_release_decoder);
+  ASSERT_NE(no_input_decoder, nullptr);
+  uhdr_gainmap_export_t no_input_result = makeResult();
+  EXPECT_EQ(uhdr_dec_export_gainmap(no_input_decoder.get(), &no_input_result).error_code,
+            UHDR_CODEC_INVALID_OPERATION);
+  expectUnchanged(no_input_result);
+
+  std::vector<uint8_t> avif_data;
+  ASSERT_TRUE(loadFile("ordinary_synthetic.avif", avif_data));
+  ASSERT_GE(avif_data.size(), 12u);
+  EXPECT_EQ(std::string(avif_data.begin() + 4, avif_data.begin() + 8), "ftyp");
+  EXPECT_EQ(std::string(avif_data.begin() + 8, avif_data.begin() + 12), "avif");
+  uhdr_compressed_image_t avif_image{};
+  avif_image.data = avif_data.data();
+  avif_image.data_sz = avif_data.size();
+  avif_image.capacity = avif_data.size();
+  avif_image.cg = UHDR_CG_UNSPECIFIED;
+  avif_image.ct = UHDR_CT_UNSPECIFIED;
+  avif_image.range = UHDR_CR_UNSPECIFIED;
+
+  std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> decoder(
+      uhdr_create_decoder(), uhdr_release_decoder);
+  ASSERT_NE(decoder, nullptr);
+  ASSERT_EQ(uhdr_dec_set_image(decoder.get(), &avif_image).error_code, UHDR_CODEC_OK);
+  uhdr_gainmap_export_t result = makeResult();
+  EXPECT_EQ(uhdr_dec_export_gainmap(decoder.get(), &result).error_code,
+            UHDR_CODEC_UNSUPPORTED_FEATURE);
+  expectUnchanged(result);
+
+  const uint8_t short_payload[] = {0x01};
+  uhdr_compressed_image_t short_image{};
+  short_image.data = const_cast<uint8_t*>(short_payload);
+  short_image.data_sz = sizeof(short_payload);
+  short_image.capacity = sizeof(short_payload);
+  short_image.cg = UHDR_CG_UNSPECIFIED;
+  short_image.ct = UHDR_CT_UNSPECIFIED;
+  short_image.range = UHDR_CR_UNSPECIFIED;
+  ASSERT_EQ(uhdr_dec_set_image(decoder.get(), &short_image).error_code, UHDR_CODEC_OK);
+  EXPECT_EQ(uhdr_dec_export_gainmap(decoder.get(), &result).error_code,
+            UHDR_CODEC_UNSUPPORTED_FEATURE);
+  expectUnchanged(result);
+
+  std::vector<uint8_t> apple_data;
+  ASSERT_TRUE(loadFile("apple_gainmap_new.jpg", apple_data));
+  uhdr_compressed_image_t apple_image{};
+  apple_image.data = apple_data.data();
+  apple_image.data_sz = apple_data.size();
+  apple_image.capacity = apple_data.size();
+  apple_image.cg = UHDR_CG_UNSPECIFIED;
+  apple_image.ct = UHDR_CT_UNSPECIFIED;
+  apple_image.range = UHDR_CR_UNSPECIFIED;
+  ASSERT_EQ(uhdr_dec_set_image(decoder.get(), &apple_image).error_code, UHDR_CODEC_OK);
+  EXPECT_EQ(uhdr_dec_export_gainmap(decoder.get(), &result).error_code, UHDR_CODEC_OK);
+  EXPECT_EQ(result.width, 384u);
+  EXPECT_EQ(result.height, 512u);
+
+  const uint8_t malformed_jpeg[] = {0xff, 0xd8, 0xff};
+  uhdr_compressed_image_t malformed_image{};
+  malformed_image.data = const_cast<uint8_t*>(malformed_jpeg);
+  malformed_image.data_sz = sizeof(malformed_jpeg);
+  malformed_image.capacity = sizeof(malformed_jpeg);
+  malformed_image.cg = UHDR_CG_UNSPECIFIED;
+  malformed_image.ct = UHDR_CT_UNSPECIFIED;
+  malformed_image.range = UHDR_CR_UNSPECIFIED;
+  std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> malformed_decoder(
+      uhdr_create_decoder(), uhdr_release_decoder);
+  ASSERT_NE(malformed_decoder, nullptr);
+  ASSERT_EQ(uhdr_dec_set_image(malformed_decoder.get(), &malformed_image).error_code,
+            UHDR_CODEC_OK);
+  uhdr_gainmap_export_t malformed_result = makeResult();
+  EXPECT_EQ(uhdr_dec_export_gainmap(malformed_decoder.get(), &malformed_result).error_code,
+            UHDR_CODEC_ERROR);
+  expectUnchanged(malformed_result);
+}
+
 TEST_F(UltraHdrApiTest, AppleGainmapExportProducesFullResolutionGrayJpeg) {
   std::vector<uint8_t> apple_data;
   ASSERT_TRUE(loadFile("apple_gainmap_new.jpg", apple_data));
@@ -686,6 +783,7 @@ TEST_F(UltraHdrApiTest, AppleGainmapExportProducesFullResolutionGrayJpeg) {
       uhdr_create_decoder(), uhdr_release_decoder);
   ASSERT_NE(decoder, nullptr);
   ASSERT_EQ(uhdr_dec_set_image(decoder.get(), &apple_image).error_code, UHDR_CODEC_OK);
+  ASSERT_EQ(uhdr_add_effect_crop(decoder.get(), 8, 376, 10, 502).error_code, UHDR_CODEC_OK);
   uhdr_gainmap_export_t exported{};
   ASSERT_EQ(uhdr_dec_export_gainmap(decoder.get(), &exported).error_code, UHDR_CODEC_OK);
 
@@ -698,6 +796,51 @@ TEST_F(UltraHdrApiTest, AppleGainmapExportProducesFullResolutionGrayJpeg) {
   EXPECT_FLOAT_EQ(exported.metadata.gamma[0], 1.0f);
   EXPECT_EQ(exported.metadata.use_base_cg, 1);
 
+  uhdr_mem_block_t* raw_map = uhdr_dec_get_gainmap_image(decoder.get());
+  ASSERT_NE(raw_map, nullptr);
+  ASSERT_NE(raw_map->data, nullptr);
+  const std::vector<uint8_t> raw_map_bytes(static_cast<const uint8_t*>(raw_map->data),
+                                           static_cast<const uint8_t*>(raw_map->data) +
+                                               raw_map->data_sz);
+  const unsigned int raw_map_width = uhdr_dec_get_gainmap_width(decoder.get());
+  const unsigned int raw_map_height = uhdr_dec_get_gainmap_height(decoder.get());
+  ASSERT_EQ(raw_map_width, 192u);
+  ASSERT_EQ(raw_map_height, 256u);
+  const uhdr_gainmap_metadata_t* raw_metadata = uhdr_dec_get_gainmap_metadata(decoder.get());
+  ASSERT_NE(raw_metadata, nullptr);
+  const float raw_headroom = raw_metadata->hdr_capacity_max;
+  const std::vector<uint8_t> canonical_map_bytes(
+      static_cast<const uint8_t*>(exported.image.data),
+      static_cast<const uint8_t*>(exported.image.data) + exported.image.data_sz);
+  const uhdr_gainmap_metadata_t canonical_metadata = exported.metadata;
+
+  ASSERT_EQ(uhdr_decode(decoder.get()).error_code, UHDR_CODEC_OK);
+  uhdr_raw_image_t* cropped_image = uhdr_get_decoded_image(decoder.get());
+  ASSERT_NE(cropped_image, nullptr);
+  EXPECT_EQ(cropped_image->w, 368u);
+  EXPECT_EQ(cropped_image->h, 492u);
+  uhdr_gainmap_export_t repeated{};
+  ASSERT_EQ(uhdr_dec_export_gainmap(decoder.get(), &repeated).error_code, UHDR_CODEC_OK);
+  ASSERT_NE(repeated.image.data, nullptr);
+  ASSERT_EQ(repeated.image.data_sz, canonical_map_bytes.size());
+  EXPECT_EQ(std::memcmp(repeated.image.data, canonical_map_bytes.data(), canonical_map_bytes.size()),
+            0);
+  EXPECT_EQ(repeated.width, exported.width);
+  EXPECT_EQ(repeated.height, exported.height);
+  EXPECT_FLOAT_EQ(repeated.metadata.max_content_boost[0],
+                  canonical_metadata.max_content_boost[0]);
+  EXPECT_FLOAT_EQ(repeated.metadata.hdr_capacity_max, canonical_metadata.hdr_capacity_max);
+
+  raw_map = uhdr_dec_get_gainmap_image(decoder.get());
+  ASSERT_NE(raw_map, nullptr);
+  ASSERT_EQ(raw_map->data_sz, raw_map_bytes.size());
+  EXPECT_EQ(std::memcmp(raw_map->data, raw_map_bytes.data(), raw_map_bytes.size()), 0);
+  EXPECT_EQ(uhdr_dec_get_gainmap_width(decoder.get()), raw_map_width);
+  EXPECT_EQ(uhdr_dec_get_gainmap_height(decoder.get()), raw_map_height);
+  raw_metadata = uhdr_dec_get_gainmap_metadata(decoder.get());
+  ASSERT_NE(raw_metadata, nullptr);
+  EXPECT_FLOAT_EQ(raw_metadata->hdr_capacity_max, raw_headroom);
+
   JpegDecoderHelper exported_map_decoder;
   ASSERT_EQ(exported_map_decoder.parseImage(exported.image.data, exported.image.data_sz)
                 .error_code,
@@ -706,6 +849,442 @@ TEST_F(UltraHdrApiTest, AppleGainmapExportProducesFullResolutionGrayJpeg) {
   EXPECT_EQ(exported_map_decoder.getDecompressedImageHeight(), exported.height);
   EXPECT_EQ(exported_map_decoder.getNumComponentsInImage(), 1u);
   EXPECT_EQ(exported_map_decoder.getDataPrecision(), 8u);
+}
+
+TEST_F(UltraHdrApiTest, AppleGainmapExportQ100MatchesCenteredDoubleOracle) {
+  struct GrayJpeg {
+    std::vector<uint8_t> bytes;
+    unsigned int width;
+    unsigned int height;
+  };
+  auto encodeGray = [](const std::vector<uint8_t>& pixels, unsigned int width,
+                       unsigned int height) {
+    uhdr_raw_image_t image{};
+    image.fmt = UHDR_IMG_FMT_8bppYCbCr400;
+    image.cg = UHDR_CG_UNSPECIFIED;
+    image.ct = UHDR_CT_SRGB;
+    image.range = UHDR_CR_FULL_RANGE;
+    image.w = width;
+    image.h = height;
+    image.planes[UHDR_PLANE_Y] = const_cast<uint8_t*>(pixels.data());
+    image.stride[UHDR_PLANE_Y] = width;
+    JpegEncoderHelper encoder;
+    const uhdr_error_info_t status = encoder.compressImage(&image, 100, nullptr, 0);
+    if (status.error_code != UHDR_CODEC_OK) return GrayJpeg{};
+    const uhdr_compressed_image_t compressed = encoder.getCompressedImage();
+    return GrayJpeg{{static_cast<const uint8_t*>(compressed.data),
+                     static_cast<const uint8_t*>(compressed.data) + compressed.data_sz},
+                    width, height};
+  };
+  auto encodeBase = [](unsigned int width, unsigned int height) {
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 3);
+    for (unsigned int y = 0; y < height; ++y) {
+      for (unsigned int x = 0; x < width; ++x) {
+        const size_t i = (static_cast<size_t>(y) * width + x) * 3;
+        pixels[i] = static_cast<uint8_t>(32 + (x * 17) % 192);
+        pixels[i + 1] = static_cast<uint8_t>(32 + (y * 19) % 192);
+        pixels[i + 2] = static_cast<uint8_t>(32 + ((x + y) * 11) % 192);
+      }
+    }
+    uhdr_raw_image_t image{};
+    image.fmt = UHDR_IMG_FMT_24bppRGB888;
+    image.cg = UHDR_CG_BT_709;
+    image.ct = UHDR_CT_SRGB;
+    image.range = UHDR_CR_FULL_RANGE;
+    image.w = width;
+    image.h = height;
+    image.planes[UHDR_PLANE_PACKED] = pixels.data();
+    image.stride[UHDR_PLANE_PACKED] = width;
+    JpegEncoderHelper encoder;
+    const uhdr_error_info_t status = encoder.compressImage(&image, 100, nullptr, 0);
+    if (status.error_code != UHDR_CODEC_OK) return std::vector<uint8_t>{};
+    const uhdr_compressed_image_t compressed = encoder.getCompressedImage();
+    return std::vector<uint8_t>(static_cast<const uint8_t*>(compressed.data),
+                                static_cast<const uint8_t*>(compressed.data) +
+                                    compressed.data_sz);
+  };
+  auto decodeGray = [](const uint8_t* data, size_t size, GrayJpeg* decoded) {
+    JpegDecoderHelper decoder;
+    if (decoder.decompressImage(data, size, DECODE_STREAM).error_code != UHDR_CODEC_OK) {
+      return false;
+    }
+    const uhdr_raw_image_t image = decoder.getDecompressedImage();
+    if (image.fmt != UHDR_IMG_FMT_8bppYCbCr400 || image.planes[UHDR_PLANE_Y] == nullptr ||
+        image.stride[UHDR_PLANE_Y] < image.w) {
+      return false;
+    }
+    decoded->width = image.w;
+    decoded->height = image.h;
+    decoded->bytes.resize(static_cast<size_t>(image.w) * image.h);
+    const auto* plane = static_cast<const uint8_t*>(image.planes[UHDR_PLANE_Y]);
+    for (unsigned int y = 0; y < image.h; ++y) {
+      std::memcpy(decoded->bytes.data() + static_cast<size_t>(y) * image.w,
+                  plane + static_cast<size_t>(y) * image.stride[UHDR_PLANE_Y], image.w);
+    }
+    return true;
+  };
+
+  const std::vector<float> headrooms = {
+      1.0f,
+      std::nextafter(1.0f, 2.0f),
+      2.0f,
+      8.0f,
+      16.0f,
+      32.0f,
+      1.0e6f,
+      std::ldexp(1.0f, 127),
+      std::numeric_limits<float>::max(),
+  };
+  std::vector<std::pair<std::string, std::vector<uint8_t>>> maps;
+  std::vector<uint8_t> ramp(3 * 5);
+  for (unsigned int y = 0; y < 5; ++y) {
+    for (unsigned int x = 0; x < 3; ++x) {
+      ramp[y * 3 + x] = static_cast<uint8_t>((x * 64 + y * 47) & 0xff);
+    }
+  }
+  maps.emplace_back("ramp", ramp);
+  std::vector<uint8_t> impulse(3 * 5, 0);
+  impulse[2 * 3 + 1] = 255;
+  maps.emplace_back("impulse", impulse);
+  std::vector<uint8_t> edge(3 * 5);
+  for (unsigned int y = 0; y < 5; ++y) {
+    for (unsigned int x = 0; x < 3; ++x) edge[y * 3 + x] = x == 0 ? 0 : 255;
+  }
+  maps.emplace_back("edge", edge);
+  std::vector<uint8_t> corners(3 * 5, 0);
+  corners[0] = corners[2] = corners[12] = corners[14] = 255;
+  maps.emplace_back("corners", corners);
+  std::vector<uint8_t> checkerboard(3 * 5);
+  for (unsigned int y = 0; y < 5; ++y) {
+    for (unsigned int x = 0; x < 3; ++x) {
+      checkerboard[y * 3 + x] = ((x + y) & 1) ? 255 : 0;
+    }
+  }
+  maps.emplace_back("checkerboard", checkerboard);
+  maps.emplace_back("constant-0", std::vector<uint8_t>{0});
+  maps.emplace_back("constant-127", std::vector<uint8_t>{127});
+  maps.emplace_back("constant-255", std::vector<uint8_t>{255});
+
+  // These budgets qualify this deterministic synthetic corpus and Q100 helper
+  // path. They are not a universal JPEG codec or perceptual error guarantee.
+  const double kMaxQError = 2.0 / 255.0;
+  for (const auto& [name, source_pixels] : maps) {
+    const unsigned int source_width = name.rfind("constant-", 0) == 0 ? 1 : 3;
+    const unsigned int source_height = name.rfind("constant-", 0) == 0 ? 1 : 5;
+    GrayJpeg source_jpeg = encodeGray(source_pixels, source_width, source_height);
+    ASSERT_FALSE(source_jpeg.bytes.empty()) << name;
+    GrayJpeg decoded_source{};
+    ASSERT_TRUE(decodeGray(source_jpeg.bytes.data(), source_jpeg.bytes.size(), &decoded_source))
+        << name;
+
+    for (const auto& geometry : {std::pair<unsigned int, unsigned int>{7, 9}, {31, 33},
+                                 {32, 32}}) {
+      const unsigned int base_width = geometry.first;
+      const unsigned int base_height = geometry.second;
+      const std::vector<uint8_t> base_bytes = encodeBase(base_width, base_height);
+      ASSERT_FALSE(base_bytes.empty()) << name;
+      uhdr_compressed_image_t base_image{};
+      base_image.data = const_cast<uint8_t*>(base_bytes.data());
+      base_image.data_sz = base_image.capacity = base_bytes.size();
+      base_image.cg = UHDR_CG_BT_709;
+      base_image.ct = UHDR_CT_UNSPECIFIED;
+      base_image.range = UHDR_CR_UNSPECIFIED;
+      uhdr_compressed_image_t source_map_image{};
+      source_map_image.data = source_jpeg.bytes.data();
+      source_map_image.data_sz = source_map_image.capacity = source_jpeg.bytes.size();
+      source_map_image.cg = UHDR_CG_UNSPECIFIED;
+      source_map_image.ct = UHDR_CT_UNSPECIFIED;
+      source_map_image.range = UHDR_CR_UNSPECIFIED;
+      uhdr_gainmap_metadata_ext_t source_metadata("1.0");
+      std::fill_n(source_metadata.min_content_boost, 3, 1.0f);
+      std::fill_n(source_metadata.max_content_boost, 3, 8.0f);
+      std::fill_n(source_metadata.gamma, 3, 1.0f);
+      std::fill_n(source_metadata.offset_sdr, 3, 0.0f);
+      std::fill_n(source_metadata.offset_hdr, 3, 0.0f);
+      source_metadata.hdr_capacity_min = 1.0f;
+      source_metadata.hdr_capacity_max = 8.0f;
+      source_metadata.use_base_cg = true;
+      uhdr_compressed_image_ext_t source_jpegr(
+          UHDR_CG_BT_709, UHDR_CT_UNSPECIFIED, UHDR_CR_UNSPECIFIED,
+          base_bytes.size() + source_jpeg.bytes.size() + 1024 * 1024);
+      JpegR composer;
+      ASSERT_EQ(composer.encodeJPEGR(&base_image, &source_map_image, &source_metadata,
+                                     &source_jpegr)
+                    .error_code,
+                UHDR_CODEC_OK)
+          << name << " " << base_width << "x" << base_height;
+
+      for (const float headroom : headrooms) {
+        uhdr_gainmap_metadata_ext_t apple_metadata("1.0");
+        apple_metadata.is_apple_gainmap = true;
+        apple_metadata.apple_gainmap_version = 131072;
+        std::fill_n(apple_metadata.min_content_boost, 3, 1.0f);
+        std::fill_n(apple_metadata.max_content_boost, 3, headroom);
+        std::fill_n(apple_metadata.gamma, 3, 2.2f);
+        std::fill_n(apple_metadata.offset_sdr, 3, 0.0f);
+        std::fill_n(apple_metadata.offset_hdr, 3, 0.0f);
+        apple_metadata.hdr_capacity_min = 1.0f;
+        apple_metadata.hdr_capacity_max = headroom;
+        apple_metadata.use_base_cg = true;
+        std::unique_ptr<uhdr_compressed_image_ext_t> normalized_jpeg;
+        uhdr_gainmap_metadata_ext_t normalized_metadata("1.0");
+        unsigned int normalized_width = 0;
+        unsigned int normalized_height = 0;
+        const uhdr_error_info_t export_status = composer.exportAppleGainMap(
+            &source_jpegr, &apple_metadata, &normalized_jpeg, &normalized_metadata,
+            &normalized_width, &normalized_height);
+        if (headroom == std::numeric_limits<float>::max()) {
+          EXPECT_EQ(export_status.error_code, UHDR_CODEC_UNSUPPORTED_FEATURE);
+          EXPECT_EQ(normalized_jpeg, nullptr);
+          continue;
+        }
+        ASSERT_EQ(export_status.error_code, UHDR_CODEC_OK)
+            << name << " " << base_width << "x" << base_height << " H=" << headroom << " "
+            << export_status.detail;
+        ASSERT_NE(normalized_jpeg, nullptr);
+        EXPECT_EQ(normalized_width, base_width);
+        EXPECT_EQ(normalized_height, base_height);
+        GrayJpeg decoded_output{};
+        ASSERT_TRUE(decodeGray(static_cast<const uint8_t*>(normalized_jpeg->data),
+                               normalized_jpeg->data_sz, &decoded_output));
+        ASSERT_EQ(decoded_output.width, base_width);
+        ASSERT_EQ(decoded_output.height, base_height);
+
+        const double log_headroom = headroom > 1.0f ? std::log(static_cast<double>(headroom)) : 1.0;
+        const size_t pixel_count = static_cast<size_t>(base_width) * base_height;
+        std::vector<double> q_errors;
+        q_errors.reserve(pixel_count);
+        std::vector<double> ideal_q_values(pixel_count);
+        std::vector<uint8_t> ideal_q8(pixel_count);
+        std::vector<double> q_rounding_errors_codes;
+        q_rounding_errors_codes.reserve(pixel_count);
+        double max_identity_error_stops = 0.0;
+        for (unsigned int y = 0; y < base_height; ++y) {
+          for (unsigned int x = 0; x < base_width; ++x) {
+            const double sx = std::clamp((x + 0.5) * source_width / base_width - 0.5, 0.0,
+                                         static_cast<double>(source_width - 1));
+            const double sy = std::clamp((y + 0.5) * source_height / base_height - 0.5, 0.0,
+                                         static_cast<double>(source_height - 1));
+            const unsigned int x0 = static_cast<unsigned int>(std::floor(sx));
+            const unsigned int y0 = static_cast<unsigned int>(std::floor(sy));
+            const unsigned int x1 = std::min(x0 + 1, source_width - 1);
+            const unsigned int y1 = std::min(y0 + 1, source_height - 1);
+            const double fx = sx - x0;
+            const double fy = sy - y0;
+            const auto mapAt = [&](unsigned int mx, unsigned int my) {
+              return static_cast<double>(decoded_source.bytes[my * source_width + mx]) / 255.0;
+            };
+            const double top = mapAt(x0, y0) * (1.0 - fx) + mapAt(x1, y0) * fx;
+            const double bottom = mapAt(x0, y1) * (1.0 - fx) + mapAt(x1, y1) * fx;
+            const double m = top * (1.0 - fy) + bottom * fy;
+            const double linear_gain = std::pow(m, 2.2);
+            const double ideal_q = headroom == 1.0f
+                                       ? 0.0
+                                       : std::log1p((static_cast<double>(headroom) - 1.0) *
+                                                   linear_gain) /
+                                             log_headroom;
+            const double direct_gain = 1.0 + (static_cast<double>(headroom) - 1.0) * linear_gain;
+            const double iso_gain = std::pow(static_cast<double>(headroom), ideal_q);
+            max_identity_error_stops = std::max(
+                max_identity_error_stops, std::abs(std::log2(iso_gain / direct_gain)));
+            const size_t index = static_cast<size_t>(y) * base_width + x;
+            const double ideal_q_code = ideal_q * 255.0;
+            const long rounded_q_code = std::lround(ideal_q_code);
+            ideal_q_values[index] = ideal_q;
+            ideal_q8[index] = static_cast<uint8_t>(std::clamp(rounded_q_code, 0L, 255L));
+            q_rounding_errors_codes.push_back(std::abs(rounded_q_code - ideal_q_code));
+            const double actual_q = static_cast<double>(decoded_output.bytes[index]) / 255.0;
+            q_errors.push_back(std::abs(actual_q - ideal_q));
+          }
+        }
+        std::sort(q_errors.begin(), q_errors.end());
+        const size_t p99_index = static_cast<size_t>(std::ceil(0.99 * q_errors.size())) - 1;
+        const double max_q_error = q_errors.back();
+        const double p99_q_error = q_errors[p99_index];
+        std::cout << std::setprecision(10) << "APPLE_Q100 pattern=" << name << " map=" << source_width << "x"
+                  << source_height << " base=" << base_width << "x" << base_height << " H="
+                  << headroom << " max_q=" << max_q_error << " p99_q=" << p99_q_error
+                  << " direct_iso_identity_stops=" << max_identity_error_stops << '\n';
+        EXPECT_LE(max_identity_error_stops, 1.0e-12)
+            << name << " " << base_width << "x" << base_height << " H=" << headroom;
+        EXPECT_LE(max_q_error, kMaxQError)
+            << name << " " << base_width << "x" << base_height << " H=" << headroom;
+        if (headroom == 1.0f) {
+          EXPECT_EQ(max_q_error, 0.0) << name << " " << base_width << "x" << base_height;
+        }
+
+        if (base_width == 31 || base_width == 32) {
+          GrayJpeg control_jpeg = encodeGray(ideal_q8, base_width, base_height);
+          ASSERT_FALSE(control_jpeg.bytes.empty()) << name << " control JPEG";
+          GrayJpeg decoded_control{};
+          ASSERT_TRUE(decodeGray(control_jpeg.bytes.data(), control_jpeg.bytes.size(),
+                                 &decoded_control))
+              << name << " control JPEG";
+          ASSERT_EQ(decoded_control.width, base_width);
+          ASSERT_EQ(decoded_control.height, base_height);
+
+          std::vector<double> codec_error_codes;
+          std::vector<double> actual_control_error_codes;
+          std::vector<double> full_block_q_errors;
+          std::vector<double> partial_block_q_errors;
+          std::vector<double> full_block_codec_errors;
+          std::vector<double> partial_block_codec_errors;
+          size_t actual_control_mismatches = 0;
+          size_t full_block_mismatches = 0;
+          size_t partial_block_mismatches = 0;
+          double max_actual_control_error_codes = 0.0;
+          codec_error_codes.reserve(pixel_count);
+          actual_control_error_codes.reserve(pixel_count);
+          for (unsigned int y = 0; y < base_height; ++y) {
+            for (unsigned int x = 0; x < base_width; ++x) {
+              const size_t index = static_cast<size_t>(y) * base_width + x;
+              const double rounded_q_code = ideal_q8[index];
+              const double codec_error =
+                  std::abs(static_cast<double>(decoded_control.bytes[index]) - rounded_q_code);
+              const double actual_control_error =
+                  std::abs(static_cast<double>(decoded_output.bytes[index]) -
+                           static_cast<double>(decoded_control.bytes[index]));
+              const bool full_block = base_width == 32 || (x < 24 && y < 32);
+              const double q_error =
+                  std::abs(static_cast<double>(decoded_output.bytes[index]) / 255.0 -
+                           ideal_q_values[index]);
+              codec_error_codes.push_back(codec_error);
+              actual_control_error_codes.push_back(actual_control_error);
+              max_actual_control_error_codes =
+                  std::max(max_actual_control_error_codes, actual_control_error);
+              if (actual_control_error != 0.0) {
+                ++actual_control_mismatches;
+                if (full_block) {
+                  ++full_block_mismatches;
+                } else {
+                  ++partial_block_mismatches;
+                }
+              }
+              if (full_block) {
+                full_block_q_errors.push_back(q_error);
+                full_block_codec_errors.push_back(codec_error);
+              } else {
+                partial_block_q_errors.push_back(q_error);
+                partial_block_codec_errors.push_back(codec_error);
+              }
+            }
+          }
+          std::sort(q_rounding_errors_codes.begin(), q_rounding_errors_codes.end());
+          std::sort(codec_error_codes.begin(), codec_error_codes.end());
+          std::sort(actual_control_error_codes.begin(), actual_control_error_codes.end());
+          const auto p99 = [](const std::vector<double>& sorted_values) {
+            const size_t index = static_cast<size_t>(std::ceil(0.99 * sorted_values.size())) - 1;
+            return sorted_values[index];
+          };
+          const auto maxValue = [](const std::vector<double>& values) {
+            return *std::max_element(values.begin(), values.end());
+          };
+          std::sort(full_block_q_errors.begin(), full_block_q_errors.end());
+          std::sort(partial_block_q_errors.begin(), partial_block_q_errors.end());
+          std::sort(full_block_codec_errors.begin(), full_block_codec_errors.end());
+          std::sort(partial_block_codec_errors.begin(), partial_block_codec_errors.end());
+          EXPECT_LE(codec_error_codes.back(), 1.0)
+              << name << " " << base_width << "x" << base_height << " H=" << headroom
+              << " Q100 decoder differs from rounded q by more than one code";
+          EXPECT_EQ(actual_control_mismatches, 0u)
+              << name << " " << base_width << "x" << base_height << " H=" << headroom
+              << " export does not match independent same-Q100 control";
+          std::cout << "APPLE_Q100_STAGE pattern=" << name << " base=" << base_width << "x"
+                    << base_height << " H=" << headroom
+                    << " round8_code_max=" << q_rounding_errors_codes.back()
+                    << " round8_code_p99=" << p99(q_rounding_errors_codes)
+                    << " codec_code_max=" << codec_error_codes.back()
+                    << " codec_code_p99=" << p99(codec_error_codes)
+                    << " actual_control_mismatches=" << actual_control_mismatches
+                    << " actual_control_max_code=" << max_actual_control_error_codes
+                    << " full_block_control_mismatches=" << full_block_mismatches
+                    << " partial_block_control_mismatches=" << partial_block_mismatches
+                    << " full_block_total_q_max=" << maxValue(full_block_q_errors)
+                    << " full_block_total_q_p99=" << p99(full_block_q_errors)
+                    << " full_block_codec_max_code=" << maxValue(full_block_codec_errors);
+          if (partial_block_q_errors.empty()) {
+            std::cout << " partial_block_total_q_max=none partial_block_total_q_p99=none"
+                         " partial_block_codec_max_code=none partial_block_codec_p99=none\n";
+          } else {
+            std::cout << " partial_block_total_q_max=" << maxValue(partial_block_q_errors)
+                      << " partial_block_total_q_p99=" << p99(partial_block_q_errors)
+                      << " partial_block_codec_max_code="
+                      << maxValue(partial_block_codec_errors)
+                      << " partial_block_codec_p99=" << p99(partial_block_codec_errors) << '\n';
+          }
+          EXPECT_LE(q_rounding_errors_codes.back(), 0.5);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(UltraHdrApiTest, AppleGainmapExportRejectsUnrepresentableIsoHeadroom) {
+  std::vector<uint8_t> apple_data;
+  ASSERT_TRUE(loadFile("apple_gainmap_new.jpg", apple_data));
+  uhdr_compressed_image_t apple_image{};
+  apple_image.data = apple_data.data();
+  apple_image.data_sz = apple_data.size();
+  apple_image.capacity = apple_data.size();
+  apple_image.cg = UHDR_CG_UNSPECIFIED;
+  apple_image.ct = UHDR_CT_UNSPECIFIED;
+  apple_image.range = UHDR_CR_UNSPECIFIED;
+
+  auto createProbedDecoder = [&]() {
+    std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> decoder(
+        uhdr_create_decoder(), uhdr_release_decoder);
+    if (!decoder || uhdr_dec_set_image(decoder.get(), &apple_image).error_code != UHDR_CODEC_OK ||
+        uhdr_dec_probe(decoder.get()).error_code != UHDR_CODEC_OK) {
+      return std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)>(nullptr,
+                                                                                    uhdr_release_decoder);
+    }
+    return decoder;
+  };
+
+  auto high_decoder = createProbedDecoder();
+  ASSERT_NE(high_decoder, nullptr);
+  auto* high_handle = dynamic_cast<uhdr_decoder_private*>(high_decoder.get());
+  ASSERT_NE(high_handle, nullptr);
+  const float representable_headroom = std::ldexp(1.0f, 127);
+  std::fill_n(high_handle->m_metadata_ext.max_content_boost, 3, representable_headroom);
+  high_handle->m_metadata_ext.hdr_capacity_max = representable_headroom;
+  uhdr_gainmap_export_t high_export{};
+  ASSERT_EQ(uhdr_dec_export_gainmap(high_decoder.get(), &high_export).error_code, UHDR_CODEC_OK);
+  EXPECT_FLOAT_EQ(high_export.metadata.hdr_capacity_max, representable_headroom);
+  ultrahdr::uhdr_gainmap_metadata_frac high_fraction;
+  ASSERT_EQ(ultrahdr::uhdr_gainmap_metadata_frac::gainmapMetadataFloatToFraction(
+                &high_handle->m_metadata_ext, &high_fraction)
+                .error_code,
+            UHDR_CODEC_OK);
+  uhdr_gainmap_metadata_ext_t high_round_trip("1.0");
+  EXPECT_EQ(ultrahdr::uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(
+                &high_fraction, &high_round_trip)
+                .error_code,
+            UHDR_CODEC_OK);
+  EXPECT_FLOAT_EQ(high_round_trip.hdr_capacity_max, representable_headroom);
+
+  auto max_decoder = createProbedDecoder();
+  ASSERT_NE(max_decoder, nullptr);
+  auto* max_handle = dynamic_cast<uhdr_decoder_private*>(max_decoder.get());
+  ASSERT_NE(max_handle, nullptr);
+  const float unrepresentable_headroom = std::numeric_limits<float>::max();
+  std::fill_n(max_handle->m_metadata_ext.max_content_boost, 3, unrepresentable_headroom);
+  max_handle->m_metadata_ext.hdr_capacity_max = unrepresentable_headroom;
+  uint8_t sentinel = 0x5a;
+  uhdr_gainmap_export_t max_export{};
+  max_export.image.data = &sentinel;
+  max_export.image.data_sz = 1;
+  max_export.image.capacity = 1;
+  max_export.width = 17;
+  max_export.height = 19;
+  max_export.metadata.max_content_boost[0] = 3.25f;
+  EXPECT_EQ(uhdr_dec_export_gainmap(max_decoder.get(), &max_export).error_code,
+            UHDR_CODEC_UNSUPPORTED_FEATURE);
+  EXPECT_EQ(max_export.image.data, &sentinel);
+  EXPECT_EQ(max_export.image.data_sz, 1u);
+  EXPECT_EQ(max_export.width, 17u);
+  EXPECT_EQ(max_export.height, 19u);
+  EXPECT_FLOAT_EQ(max_export.metadata.max_content_boost[0], 3.25f);
 }
 
 TEST_F(UltraHdrApiTest, RoutingProbeRejectsInvalidInputAndOrdinaryJpeg) {

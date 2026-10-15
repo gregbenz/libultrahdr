@@ -15,11 +15,17 @@
 #endif
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "ultrahdr_api.h"
 
@@ -27,6 +33,7 @@
 #include "ultrahdr/jpegr.h"
 #include "ultrahdr/jpegrutils.h"
 #include "ultrahdr/gainmapmetadata.h"
+#include "ultrahdr/gainmapmath.h"
 
 //#define DUMP_OUTPUT
 
@@ -1675,6 +1682,299 @@ TEST(JpegRTest, ApplyGainMapInvalidArgs) {
   EXPECT_EQ(uHdrLib.applyGainMap(&sdr_intent, &gainmap_img, &metadata, UHDR_CT_LINEAR, dest.fmt, 2.0f, &dest).error_code, UHDR_CODEC_INVALID_PARAM);
 }
 
+TEST(JpegRTest, AppleApplyGainMapMatchesCenteredScalarOracle) {
+  struct MapPattern {
+    std::string name;
+    unsigned int width;
+    unsigned int height;
+    std::vector<uint8_t> values;
+  };
+  std::vector<MapPattern> patterns;
+  std::vector<uint8_t> ramp(3 * 5);
+  for (unsigned int y = 0; y < 5; ++y) {
+    for (unsigned int x = 0; x < 3; ++x) {
+      ramp[y * 3 + x] = static_cast<uint8_t>((x * 64 + y * 47) & 0xff);
+    }
+  }
+  patterns.push_back({"ramp", 3, 5, ramp});
+  std::vector<uint8_t> impulse(3 * 5, 0);
+  impulse[2 * 3 + 1] = 255;
+  patterns.push_back({"impulse", 3, 5, impulse});
+  std::vector<uint8_t> edge(3 * 5);
+  for (unsigned int y = 0; y < 5; ++y) {
+    for (unsigned int x = 0; x < 3; ++x) edge[y * 3 + x] = x == 0 ? 0 : 255;
+  }
+  patterns.push_back({"vertical-edge", 3, 5, edge});
+  std::vector<uint8_t> corners(3 * 5, 0);
+  corners[0] = corners[2] = corners[12] = corners[14] = 255;
+  patterns.push_back({"corners", 3, 5, corners});
+  std::vector<uint8_t> checkerboard(3 * 5);
+  for (unsigned int y = 0; y < 5; ++y) {
+    for (unsigned int x = 0; x < 3; ++x) {
+      checkerboard[y * 3 + x] = ((x + y) & 1) ? 255 : 0;
+    }
+  }
+  patterns.push_back({"checkerboard", 3, 5, checkerboard});
+  patterns.push_back({"constant-127", 1, 1, {127}});
+
+  const std::vector<float> headrooms = {1.0f,
+                                        std::nextafter(1.0f, 2.0f),
+                                        2.0f,
+                                        8.0f,
+                                        8.5f,
+                                        9.0f,
+                                        16.0f,
+                                        32.0f,
+                                        1.0e6f,
+                                        std::ldexp(1.0f, 127)};
+  const std::vector<float> requested_boosts = {1.0f, 2.0f, 4.0f, 8.0f};
+  constexpr double kLinearOutputMax = 10000.0 / 203.0;
+  constexpr float kTablePowerError = 8.0e-7f;
+  constexpr double kTableGainStopBudget = 9.0e-6;
+  constexpr double kFinalGainArithmeticReserve = 1.0e-6;
+  constexpr double kTotalGainStopBudget = 1.0e-5;
+  constexpr float kAppleMapGamma = 2.2f;
+  constexpr uint64_t kPaddingSentinel = 0xdeadbeefcafef00dULL;
+  static_assert(kTableGainStopBudget + kFinalGainArithmeticReserve <= kTotalGainStopBudget);
+
+  std::array<float, 1024> power_table{};
+  double max_power_entry_error = 0.0;
+  for (size_t i = 0; i < power_table.size(); ++i) {
+    const float value = static_cast<float>(i) / static_cast<float>(power_table.size() - 1);
+    power_table[i] = std::pow(value, kAppleMapGamma);
+    const double exact_power =
+        std::pow(static_cast<double>(value), static_cast<double>(kAppleMapGamma));
+    const float lower = std::nextafter(power_table[i], -std::numeric_limits<float>::infinity());
+    const float upper = std::nextafter(power_table[i], std::numeric_limits<float>::infinity());
+    const double down_ulp = static_cast<double>(power_table[i]) - lower;
+    const double up_ulp = static_cast<double>(upper) - power_table[i];
+    const double adjacent_float_ulp = std::max(down_ulp, up_ulp);
+    const double entry_error = std::abs(static_cast<double>(power_table[i]) - exact_power);
+    max_power_entry_error = std::max(max_power_entry_error, entry_error);
+    EXPECT_LE(entry_error, adjacent_float_ulp) << "table entry " << i;
+  }
+  std::cout << std::setprecision(10) << "APPLE_POWER_TABLE entries=" << power_table.size()
+            << " max_double_error=" << max_power_entry_error << " one_float_ulp=verified\n";
+  const auto evaluatePowerTable = [&power_table](float value) {
+    const float position = value * static_cast<float>(power_table.size() - 1);
+    const size_t lower = static_cast<size_t>(position);
+    if (lower >= power_table.size() - 1) return power_table.back();
+    const float fraction = position - static_cast<float>(lower);
+    return power_table[lower] + fraction * (power_table[lower + 1] - power_table[lower]);
+  };
+
+  const double base_encoded = 128.0 / 255.0;
+  const double base_linear_scalar =
+      std::pow((base_encoded + 0.055) / 1.055, 2.4);
+  const double base_lut_error =
+      std::abs(static_cast<double>(srgbInvOetfExtendedLUT(static_cast<float>(base_encoded))) -
+               base_linear_scalar);
+  EXPECT_LE(base_lut_error, 1.0e-6);
+
+  TestJpegR decoder;
+  for (const MapPattern& pattern : patterns) {
+    const size_t map_stride = pattern.width + 3;
+    std::vector<uint8_t> map_storage(map_stride * pattern.height, 0xee);
+    for (unsigned int y = 0; y < pattern.height; ++y) {
+      std::copy_n(pattern.values.data() + static_cast<size_t>(y) * pattern.width, pattern.width,
+                  map_storage.data() + static_cast<size_t>(y) * map_stride);
+    }
+    uhdr_raw_image_t map{};
+    map.fmt = UHDR_IMG_FMT_8bppYCbCr400;
+    map.cg = UHDR_CG_UNSPECIFIED;
+    map.ct = UHDR_CT_SRGB;
+    map.range = UHDR_CR_FULL_RANGE;
+    map.w = pattern.width;
+    map.h = pattern.height;
+    map.planes[UHDR_PLANE_Y] = map_storage.data();
+    map.stride[UHDR_PLANE_Y] = map_stride;
+
+    for (const auto& geometry : {std::pair<unsigned int, unsigned int>{7, 9}, {31, 33}}) {
+      const unsigned int width = geometry.first;
+      const unsigned int height = geometry.second;
+      const size_t base_stride = width + 2;
+      std::vector<uint8_t> y_storage(base_stride * height, 0xe1);
+      std::vector<uint8_t> u_storage(base_stride * height, 0xe2);
+      std::vector<uint8_t> v_storage(base_stride * height, 0xe3);
+      for (unsigned int y = 0; y < height; ++y) {
+        std::fill_n(y_storage.data() + static_cast<size_t>(y) * base_stride, width, 128);
+        std::fill_n(u_storage.data() + static_cast<size_t>(y) * base_stride, width, 128);
+        std::fill_n(v_storage.data() + static_cast<size_t>(y) * base_stride, width, 128);
+      }
+      uhdr_raw_image_t base{};
+      base.fmt = UHDR_IMG_FMT_24bppYCbCr444;
+      base.cg = UHDR_CG_DISPLAY_P3;
+      base.ct = UHDR_CT_SRGB;
+      base.range = UHDR_CR_FULL_RANGE;
+      base.w = width;
+      base.h = height;
+      base.planes[UHDR_PLANE_Y] = y_storage.data();
+      base.planes[UHDR_PLANE_U] = u_storage.data();
+      base.planes[UHDR_PLANE_V] = v_storage.data();
+      base.stride[UHDR_PLANE_Y] = base_stride;
+      base.stride[UHDR_PLANE_U] = base_stride;
+      base.stride[UHDR_PLANE_V] = base_stride;
+
+      for (const float headroom : headrooms) {
+        std::vector<float> display_boosts;
+        for (const float requested : requested_boosts) {
+          const float boost = std::min(requested, headroom);
+          if (display_boosts.empty() || display_boosts.back() != boost) {
+            display_boosts.push_back(boost);
+          }
+        }
+        if (display_boosts.back() != headroom) display_boosts.push_back(headroom);
+
+        const double table_stop_bound =
+            std::log2(1.0 + (static_cast<double>(headroom) - 1.0) * kTablePowerError);
+        const bool table_is_used =
+            std::isfinite(table_stop_bound) && table_stop_bound <= kTableGainStopBudget;
+        if (headroom == 8.0f || headroom == 8.5f) EXPECT_TRUE(table_is_used);
+        if (headroom == 9.0f || headroom == 16.0f) EXPECT_FALSE(table_is_used);
+        uhdr_gainmap_metadata_ext_t metadata("1.0");
+        metadata.is_apple_gainmap = true;
+        metadata.apple_gainmap_version = 131072;
+        std::fill_n(metadata.min_content_boost, 3, 1.0f);
+        std::fill_n(metadata.max_content_boost, 3, headroom);
+        std::fill_n(metadata.gamma, 3, 1.0f);
+        std::fill_n(metadata.offset_sdr, 3, 0.0f);
+        std::fill_n(metadata.offset_hdr, 3, 0.0f);
+        metadata.hdr_capacity_min = 1.0f;
+        metadata.hdr_capacity_max = headroom;
+        metadata.use_base_cg = true;
+
+        for (const float display_boost : display_boosts) {
+          const size_t destination_stride = width + 1;
+          std::vector<uint64_t> output(destination_stride * height, kPaddingSentinel);
+          uhdr_raw_image_t dest{};
+          dest.fmt = UHDR_IMG_FMT_64bppRGBAHalfFloat;
+          dest.cg = UHDR_CG_DISPLAY_P3;
+          dest.ct = UHDR_CT_LINEAR;
+          dest.range = UHDR_CR_FULL_RANGE;
+          dest.w = width;
+          dest.h = height;
+          dest.planes[UHDR_PLANE_PACKED] = output.data();
+          dest.stride[UHDR_PLANE_PACKED] = destination_stride;
+
+          const uhdr_error_info_t status = decoder.applyGainMap(
+              &base, &map, &metadata, UHDR_CT_LINEAR, UHDR_IMG_FMT_64bppRGBAHalfFloat,
+              display_boost, &dest, true, 1, 1);
+          ASSERT_EQ(status.error_code, UHDR_CODEC_OK)
+              << pattern.name << " " << width << "x" << height << " H=" << headroom
+              << " D=" << display_boost << " " << status.detail;
+
+          double max_power_abs_error = 0.0;
+          double max_gain_stop_error = 0.0;
+          unsigned int max_half_ulp = 0;
+          size_t saturated_pixels = 0;
+          size_t nonsaturated_pixels = 0;
+          for (unsigned int y = 0; y < height; ++y) {
+            for (unsigned int x = 0; x < width; ++x) {
+              const double source_x = std::clamp(
+                  (static_cast<double>(x) + 0.5) * pattern.width / width - 0.5, 0.0,
+                  static_cast<double>(pattern.width - 1));
+              const double source_y = std::clamp(
+                  (static_cast<double>(y) + 0.5) * pattern.height / height - 0.5, 0.0,
+                  static_cast<double>(pattern.height - 1));
+              const unsigned int x0 = static_cast<unsigned int>(std::floor(source_x));
+              const unsigned int y0 = static_cast<unsigned int>(std::floor(source_y));
+              const unsigned int x1 = std::min(x0 + 1, pattern.width - 1);
+              const unsigned int y1 = std::min(y0 + 1, pattern.height - 1);
+              const double fx = source_x - x0;
+              const double fy = source_y - y0;
+              const auto mapAt = [&pattern](unsigned int mx, unsigned int my) {
+                return static_cast<double>(pattern.values[my * pattern.width + mx]) / 255.0;
+              };
+              const double top = mapAt(x0, y0) * (1.0 - fx) + mapAt(x1, y0) * fx;
+              const double bottom = mapAt(x0, y1) * (1.0 - fx) + mapAt(x1, y1) * fx;
+              const double sampled_map = top * (1.0 - fy) + bottom * fy;
+              const float sampled_map_float = static_cast<float>(sampled_map);
+              const double exact_power = std::pow(sampled_map, 2.2);
+              const float modeled_power = table_is_used
+                                              ? evaluatePowerTable(sampled_map_float)
+                                              : std::pow(sampled_map_float, 2.2f);
+              max_power_abs_error = std::max(
+                  max_power_abs_error,
+                  std::abs(static_cast<double>(modeled_power) - exact_power));
+              const double expected_gain =
+                  1.0 + (static_cast<double>(display_boost) - 1.0) * exact_power;
+              const double modeled_gain =
+                  1.0 + (static_cast<double>(display_boost) - 1.0) * modeled_power;
+              max_gain_stop_error = std::max(
+                  max_gain_stop_error, std::abs(std::log2(modeled_gain / expected_gain)));
+
+              const double expected_linear = base_linear_scalar * expected_gain;
+              const bool saturated = expected_linear >= kLinearOutputMax;
+              const float bounded_linear =
+                  static_cast<float>(std::clamp(expected_linear, 0.0, kLinearOutputMax));
+              const uint16_t expected_half = floatToHalf(bounded_linear);
+              const size_t output_index = static_cast<size_t>(y) * destination_stride + x;
+              const uint64_t packed = output[output_index];
+              const std::array<uint16_t, 4> actual_half = {
+                  static_cast<uint16_t>(packed & 0xffff),
+                  static_cast<uint16_t>((packed >> 16) & 0xffff),
+                  static_cast<uint16_t>((packed >> 32) & 0xffff),
+                  static_cast<uint16_t>((packed >> 48) & 0xffff)};
+              EXPECT_EQ(halfToFloat(actual_half[3]), 1.0f)
+                  << pattern.name << " " << width << "x" << height << " H=" << headroom
+                  << " D=" << display_boost << " at " << x << "," << y;
+              for (size_t channel = 0; channel < 3; ++channel) {
+                const float actual_linear = halfToFloat(actual_half[channel]);
+                EXPECT_TRUE(std::isfinite(actual_linear))
+                    << pattern.name << " " << width << "x" << height << " H=" << headroom
+                    << " D=" << display_boost << " at " << x << "," << y;
+                EXPECT_GE(actual_linear, 0.0f);
+                EXPECT_LE(actual_linear, static_cast<float>(kLinearOutputMax));
+                const unsigned int ulp_distance = static_cast<unsigned int>(std::abs(
+                    static_cast<int>(actual_half[channel]) - static_cast<int>(expected_half)));
+                if (saturated) {
+                  EXPECT_EQ(actual_half[channel], expected_half)
+                      << pattern.name << " " << width << "x" << height << " H=" << headroom
+                      << " D=" << display_boost << " at " << x << "," << y;
+                } else {
+                  ++nonsaturated_pixels;
+                  max_half_ulp = std::max(max_half_ulp, ulp_distance);
+                  EXPECT_LE(ulp_distance, 1u)
+                      << pattern.name << " " << width << "x" << height << " H=" << headroom
+                      << " D=" << display_boost << " at " << x << "," << y;
+                }
+              }
+              if (saturated) ++saturated_pixels;
+            }
+          }
+          for (unsigned int y = 0; y < height; ++y) {
+            EXPECT_EQ(output[static_cast<size_t>(y) * destination_stride + width],
+                      kPaddingSentinel);
+            for (size_t x = width; x < base_stride; ++x) {
+              EXPECT_EQ(y_storage[static_cast<size_t>(y) * base_stride + x], 0xe1);
+              EXPECT_EQ(u_storage[static_cast<size_t>(y) * base_stride + x], 0xe2);
+              EXPECT_EQ(v_storage[static_cast<size_t>(y) * base_stride + x], 0xe3);
+            }
+          }
+          for (unsigned int y = 0; y < pattern.height; ++y) {
+            for (size_t x = pattern.width; x < map_stride; ++x) {
+              EXPECT_EQ(map_storage[static_cast<size_t>(y) * map_stride + x], 0xee);
+            }
+          }
+
+          EXPECT_LE(max_power_abs_error, static_cast<double>(kTablePowerError));
+          EXPECT_LE(max_gain_stop_error, kTableGainStopBudget);
+          std::cout << std::setprecision(10) << "APPLE_APPLY_MAP pattern=" << pattern.name
+                    << " map=" << pattern.width << "x" << pattern.height << " base=" << width
+                    << "x" << height << " H=" << headroom << " D=" << display_boost
+                    << " path=" << (table_is_used ? "table" : "scalar")
+                    << " power_abs_error=" << max_power_abs_error
+                    << " gain_stop_error=" << max_gain_stop_error
+                    << " base_lut_abs_error=" << base_lut_error << " max_half_ulp="
+                    << max_half_ulp << " nonsaturated=" << nonsaturated_pixels
+                    << " saturated=" << saturated_pixels
+                    << " alpha=1 finite=1 padded=preserved\n";
+        }
+      }
+    }
+  }
+}
+
 TEST(JpegRTest, writeXmpThenRead) {
   uhdr_gainmap_metadata_ext_t metadata_expected("1.0");
   std::fill_n(metadata_expected.max_content_boost, 3, 1.25f);
@@ -1828,6 +2128,92 @@ TEST(JpegRTest, readAppleHeadroomFromExif) {
   // maker33 < 1 and maker48 <= 0.01: stops = -20 * maker48 + 1.8.
   EXPECT_FLOAT_EQ(metadata.hdr_capacity_max, (float)pow(2.0, 1.7));
   EXPECT_FLOAT_EQ(metadata.max_content_boost[0], (float)pow(2.0, 1.7));
+}
+
+TEST(JpegRTest, readAppleHeadroomNearIsoFloatBoundary) {
+  const size_t maker = 6 + 44;
+  std::vector<uint8_t> xmp_data = appleXmpWithoutHeadroom();
+  for (const auto& boundary : {std::pair<int32_t, uint32_t>{-62, 35},
+                               std::pair<int32_t, uint32_t>{-1785714284, 1000000000}}) {
+    std::vector<uint8_t> exif = appleExif(AppleExifOffsets());
+    putU32(exif, maker + 46, 1, true);  // maker33 = 1, selecting the -70 slope.
+    putU32(exif, maker + 50, 1, true);
+    putU32(exif, maker + 54, static_cast<uint32_t>(boundary.first), true);
+    putU32(exif, maker + 58, boundary.second, true);
+
+    uhdr_gainmap_metadata_ext_t metadata;
+    ASSERT_EQ(getMetadataFromXMP(xmp_data.data(), xmp_data.size(), exif.data(), exif.size(),
+                                 &metadata)
+                  .error_code,
+              UHDR_CODEC_OK);
+    if (boundary.first == -62) {
+      EXPECT_FLOAT_EQ(metadata.hdr_capacity_max, std::ldexp(1.0f, 127));
+    } else {
+      EXPECT_FLOAT_EQ(metadata.hdr_capacity_max, std::numeric_limits<float>::max());
+    }
+  }
+}
+
+TEST(JpegRTest, appleExifRequiresCompleteUniqueSignedRationalPair) {
+  std::vector<uint8_t> xmp = appleXmpWithoutHeadroom();
+  const size_t maker = 6 + 44;
+  uhdr_gainmap_metadata_ext_t metadata;
+
+  // Neither field is optional when XMP does not carry a headroom fallback.
+  for (const size_t entry : {maker + 16, maker + 28}) {
+    std::vector<uint8_t> exif = appleExif(AppleExifOffsets());
+    putU16(exif, entry, 49, true);
+    EXPECT_EQ(getMetadataFromXMP(xmp.data(), xmp.size(), exif.data(), exif.size(), &metadata)
+                  .error_code,
+              UHDR_CODEC_ERROR);
+  }
+
+  // Apple Maker Note headroom fields must each be one signed rational.
+  std::vector<uint8_t> wrongType = appleExif(AppleExifOffsets());
+  putU16(wrongType, maker + 30, 5, true);
+  EXPECT_EQ(getMetadataFromXMP(xmp.data(), xmp.size(), wrongType.data(), wrongType.size(),
+                               &metadata)
+                .error_code,
+            UHDR_CODEC_ERROR);
+
+  std::vector<uint8_t> wrongCount = appleExif(AppleExifOffsets());
+  putU32(wrongCount, maker + 32, 2, true);
+  EXPECT_EQ(getMetadataFromXMP(xmp.data(), xmp.size(), wrongCount.data(), wrongCount.size(),
+                               &metadata)
+                .error_code,
+            UHDR_CODEC_ERROR);
+
+  std::vector<uint8_t> zeroDenominator = appleExif(AppleExifOffsets());
+  putU32(zeroDenominator, maker + 58, 0, true);
+  EXPECT_EQ(getMetadataFromXMP(xmp.data(), xmp.size(), zeroDenominator.data(),
+                               zeroDenominator.size(), &metadata)
+                .error_code,
+            UHDR_CODEC_ERROR);
+
+  // A negative denominator remains valid signed-rational data and is divided normally.
+  std::vector<uint8_t> negativeDenominator = appleExif(AppleExifOffsets());
+  putU32(negativeDenominator, maker + 54, 5, true);
+  putU32(negativeDenominator, maker + 58, static_cast<uint32_t>(-1000), true);
+  ASSERT_EQ(getMetadataFromXMP(xmp.data(), xmp.size(), negativeDenominator.data(),
+                               negativeDenominator.size(), &metadata)
+                .error_code,
+            UHDR_CODEC_OK);
+  EXPECT_FLOAT_EQ(metadata.hdr_capacity_max, static_cast<float>(pow(2.0, 1.9)));
+
+  // Duplicate tag 33 must be rejected even when both original values are well formed.
+  std::vector<uint8_t> duplicate = appleExif(AppleExifOffsets());
+  duplicate.insert(duplicate.begin() + maker + 40, 12, 0);
+  putU16(duplicate, maker + 14, 3, true);
+  putU32(duplicate, maker + 24, 58, true);
+  putU32(duplicate, maker + 36, 66, true);
+  putU16(duplicate, maker + 40, 33, true);
+  putU16(duplicate, maker + 42, 10, true);
+  putU32(duplicate, maker + 44, 1, true);
+  putU32(duplicate, maker + 48, 58, true);
+  putU32(duplicate, maker + 52, 0, true);
+  EXPECT_EQ(getMetadataFromXMP(xmp.data(), xmp.size(), duplicate.data(), duplicate.size(), &metadata)
+                .error_code,
+            UHDR_CODEC_ERROR);
 }
 
 // Every offset read from the EXIF data must be rejected when it points past the end of the

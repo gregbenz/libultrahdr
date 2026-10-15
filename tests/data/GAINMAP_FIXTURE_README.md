@@ -16,3 +16,30 @@ it is an explicit exception to the general CC-BY-4.0 license used by the pre-exi
 directory.
 
 SPDX-License-Identifier: Apache-2.0 OR MIT
+
+## Ordinary AVIF rejection fixture: `ordinary_synthetic.avif`
+
+This is a 16x16 lossless AVIF generated from a deterministic RGB pattern. It contains no external
+image data, EXIF, XMP, ICC profile, or gain map. It exercises the decoder-export API's non-JPEG
+input rejection path.
+
+Reproduction uses ImageMagick 7.1.2-27 and `avifenc` 1.3.0 with AOM 3.14.1. The standard-library
+Python snippet creates the pattern; ImageMagick converts it to PNG; `avifenc` writes the AVIF:
+
+```sh
+python3 - <<'PY'
+from pathlib import Path
+w = h = 16
+pixels = bytearray()
+for y in range(h):
+    for x in range(w):
+        pixels.extend(((x * 17) & 255, (y * 17) & 255, ((x ^ y) * 17) & 255))
+Path('/tmp/ordinary_synthetic.ppm').write_bytes(
+    f'P6\n{w} {h}\n255\n'.encode('ascii') + pixels)
+PY
+magick /tmp/ordinary_synthetic.ppm -depth 8 /tmp/ordinary_synthetic.png
+avifenc --qcolor 100 --depth 8 --yuv 444 --cicp 1/13/0 --speed 10 --jobs 1 \
+  /tmp/ordinary_synthetic.png tests/data/ordinary_synthetic.avif
+```
+
+SHA-256: `0bb8247849a2056723b2dd7895babf3d325c910ee035a2dc6ce1ead3fa26614b`

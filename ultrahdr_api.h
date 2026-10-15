@@ -802,6 +802,9 @@ UHDR_EXTERN uhdr_mem_block_t* uhdr_dec_get_base_image(uhdr_codec_private_t* dec)
 
 /*!\brief Get gain map image (compressed)
  *
+ * For Apple-only JPEG-R input, this returns the source Apple-encoded map, not an ISO-compatible
+ * recomposition component. Use uhdr_dec_export_gainmap() to transcode the map for ISO JPEG-R.
+ *
  * \param[in]  dec  decoder instance.
  *
  * \return nullptr if probe process call is unsuccessful, memory block with gainmap image data
@@ -810,6 +813,9 @@ UHDR_EXTERN uhdr_mem_block_t* uhdr_dec_get_base_image(uhdr_codec_private_t* dec)
 UHDR_EXTERN uhdr_mem_block_t* uhdr_dec_get_gainmap_image(uhdr_codec_private_t* dec);
 
 /*!\brief Get gain map metadata
+ *
+ * For Apple-only JPEG-R input, this describes the source Apple map and is not an ISO-compatible
+ * recomposition pair with uhdr_dec_get_gainmap_image(); use uhdr_dec_export_gainmap() to transcode.
  *
  * \param[in]  dec  decoder instance.
  *
@@ -820,12 +826,20 @@ UHDR_EXTERN uhdr_gainmap_metadata_t* uhdr_dec_get_gainmap_metadata(uhdr_codec_pr
 /*!\brief Export the compressed gain-map image with ISO-compatible metadata.
  *
  * The call probes the input if needed and freezes decoder configuration, as uhdr_decode() does.
+ * A present payload shorter than a JPEG SOI marker or with a different prefix is rejected before
+ * probing, so the caller may replace that input with uhdr_dec_set_image(). With no input, the
+ * normal probe error is returned.
  * A valid ISO/Adobe JPEG-R gain map is returned byte-for-byte. An Apple-only JPEG-R gain map is
  * converted to a full-base-resolution grayscale JPEG. The compressed bytes are owned by the
  * decoder, must be treated as read-only, and remain valid until reset or release. Width and height
  * describe the exported gain map in source coordinates and are independent of queued or applied
  * decoder effects. Probing freezes decoder configuration, while configured effects retain their
- * existing decode behavior. On failure, result is unchanged. Non-JPEG inputs are unsupported.
+ * existing decode behavior. Apple normalization preserves the SDR endpoint and approximates the
+ * full-headroom endpoint; JPEG map conversion remains lossy, including at quality 100. Intermediate
+ * display boosts follow the ISO gain-map adaptation rule. At Apple headroom 1, the exported map is
+ * neutral, boosts are 1..1, and the inert capacity interval is 1..2. Export fails if normalized
+ * metadata cannot round-trip through the existing ISO rational representation.
+ * On failure, result is unchanged. Non-JPEG inputs are unsupported.
  *
  * \param[in] dec decoder instance
  * \param[out] result receives the gain-map JPEG, metadata, and exported gain-map dimensions

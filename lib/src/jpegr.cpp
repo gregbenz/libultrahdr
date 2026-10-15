@@ -51,13 +51,19 @@ uhdr_error_info_t applyGainMapGLES(uhdr_raw_image_t* sdr_intent, uhdr_raw_image_
 namespace {
 
 constexpr size_t kAppleMapPowerTableSize = 1024;
-constexpr float kAppleMapPowerTableError = 3.2e-7f;
+// With f'' <= 2.64, the ideal interpolation error is below 3.2e-7 for 1024
+// samples. The 8e-7 budget also covers rounded table entries, float lookup
+// coordinates/interpolation, and the float map sample. Reserve 1e-6 stops for
+// final gain arithmetic, leaving 9e-6 stops for table selection.
+constexpr float kAppleMapPowerTableError = 8.0e-7f;
+constexpr double kAppleMapPowerTableGainStopBudget = 9.0e-6;
 
 class AppleMapPowerTable {
  public:
   explicit AppleMapPowerTable(float headroom) {
     const double boost_error = std::log2(1.0 + (headroom - 1.0) * kAppleMapPowerTableError);
-    m_use_table = std::isfinite(boost_error) && boost_error <= 1.0e-5;
+    m_use_table =
+        std::isfinite(boost_error) && boost_error <= kAppleMapPowerTableGainStopBudget;
     if (m_use_table) {
       for (size_t i = 0; i < m_values.size(); ++i) {
         const float value = static_cast<float>(i) / static_cast<float>(m_values.size() - 1);
@@ -1739,6 +1745,24 @@ uhdr_error_info_t JpegR::exportAppleGainMap(
   normalized_metadata.hdr_capacity_min = 1.0f;
   normalized_metadata.hdr_capacity_max = headroom > 1.0f ? headroom : 2.0f;
   normalized_metadata.use_base_cg = true;
+
+  uhdr_gainmap_metadata_frac iso_metadata;
+  uhdr_gainmap_metadata_ext_t round_trip_metadata(kJpegrVersion);
+  uhdr_error_info_t metadata_status =
+      uhdr_gainmap_metadata_frac::gainmapMetadataFloatToFraction(&normalized_metadata,
+                                                                 &iso_metadata);
+  if (metadata_status.error_code == UHDR_CODEC_OK) {
+    metadata_status = uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(
+        &iso_metadata, &round_trip_metadata);
+  }
+  if (metadata_status.error_code != UHDR_CODEC_OK) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail,
+             "Apple gain-map headroom cannot be represented by ISO metadata");
+    return status;
+  }
 
   if (normalized_map_jpeg.data == nullptr || normalized_map_jpeg.data_sz == 0) {
     uhdr_error_info_t status;

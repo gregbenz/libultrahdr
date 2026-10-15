@@ -2221,6 +2221,18 @@ uhdr_error_info_t uhdr_dec_export_gainmap(uhdr_codec_private_t* dec,
   }
 
   uhdr_decoder_private* handle = dynamic_cast<uhdr_decoder_private*>(dec);
+  if (handle->m_uhdr_compressed_img != nullptr && handle->m_uhdr_compressed_img->data != nullptr) {
+    const auto* input = static_cast<const uint8_t*>(handle->m_uhdr_compressed_img->data);
+    if (handle->m_uhdr_compressed_img->data_sz < 2 || input[0] != 0xff || input[1] != 0xd8) {
+      uhdr_error_info_t status = g_no_error;
+      status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+      status.has_detail = 1;
+      snprintf(status.detail, sizeof status.detail,
+               "gain-map export is supported for JPEG-R inputs only");
+      return status;
+    }
+  }
+
   if (!handle->m_gainmap_export_attempted) {
     handle->m_gainmap_export_attempted = true;
     handle->m_gainmap_export_status = uhdr_dec_probe(dec);
