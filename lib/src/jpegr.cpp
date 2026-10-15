@@ -1665,6 +1665,36 @@ uhdr_error_info_t JpegR::exportAppleGainMap(
     return status;
   }
 
+  uhdr_gainmap_metadata_ext_t normalized_metadata(kJpegrVersion);
+  for (int channel = 0; channel < 3; ++channel) {
+    normalized_metadata.min_content_boost[channel] = 1.0f;
+    normalized_metadata.max_content_boost[channel] = headroom;
+    normalized_metadata.gamma[channel] = 1.0f;
+    normalized_metadata.offset_sdr[channel] = 0.0f;
+    normalized_metadata.offset_hdr[channel] = 0.0f;
+  }
+  normalized_metadata.hdr_capacity_min = 1.0f;
+  normalized_metadata.hdr_capacity_max = headroom > 1.0f ? headroom : 2.0f;
+  normalized_metadata.use_base_cg = true;
+
+  uhdr_gainmap_metadata_frac iso_metadata;
+  uhdr_gainmap_metadata_ext_t round_trip_metadata(kJpegrVersion);
+  uhdr_error_info_t metadata_status =
+      uhdr_gainmap_metadata_frac::gainmapMetadataFloatToFraction(&normalized_metadata,
+                                                                 &iso_metadata);
+  if (metadata_status.error_code == UHDR_CODEC_OK) {
+    metadata_status = uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(
+        &iso_metadata, &round_trip_metadata);
+  }
+  if (metadata_status.error_code != UHDR_CODEC_OK) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail,
+             "Apple gain-map headroom cannot be represented by ISO metadata");
+    return status;
+  }
+
   uhdr_compressed_image_t base_jpeg{};
   uhdr_compressed_image_t source_map_jpeg{};
   UHDR_ERR_CHECK(extractPrimaryImageAndGainMap(input, &base_jpeg, &source_map_jpeg));
@@ -1733,36 +1763,6 @@ uhdr_error_info_t JpegR::exportAppleGainMap(
   JpegEncoderHelper map_encoder;
   UHDR_ERR_CHECK(map_encoder.compressImage(&normalized_map_image, 100, nullptr, 0));
   uhdr_compressed_image_t normalized_map_jpeg = map_encoder.getCompressedImage();
-
-  uhdr_gainmap_metadata_ext_t normalized_metadata(kJpegrVersion);
-  for (int channel = 0; channel < 3; ++channel) {
-    normalized_metadata.min_content_boost[channel] = 1.0f;
-    normalized_metadata.max_content_boost[channel] = headroom;
-    normalized_metadata.gamma[channel] = 1.0f;
-    normalized_metadata.offset_sdr[channel] = 0.0f;
-    normalized_metadata.offset_hdr[channel] = 0.0f;
-  }
-  normalized_metadata.hdr_capacity_min = 1.0f;
-  normalized_metadata.hdr_capacity_max = headroom > 1.0f ? headroom : 2.0f;
-  normalized_metadata.use_base_cg = true;
-
-  uhdr_gainmap_metadata_frac iso_metadata;
-  uhdr_gainmap_metadata_ext_t round_trip_metadata(kJpegrVersion);
-  uhdr_error_info_t metadata_status =
-      uhdr_gainmap_metadata_frac::gainmapMetadataFloatToFraction(&normalized_metadata,
-                                                                 &iso_metadata);
-  if (metadata_status.error_code == UHDR_CODEC_OK) {
-    metadata_status = uhdr_gainmap_metadata_frac::gainmapMetadataFractionToFloat(
-        &iso_metadata, &round_trip_metadata);
-  }
-  if (metadata_status.error_code != UHDR_CODEC_OK) {
-    uhdr_error_info_t status;
-    status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
-    status.has_detail = 1;
-    snprintf(status.detail, sizeof status.detail,
-             "Apple gain-map headroom cannot be represented by ISO metadata");
-    return status;
-  }
 
   if (normalized_map_jpeg.data == nullptr || normalized_map_jpeg.data_sz == 0) {
     uhdr_error_info_t status;
