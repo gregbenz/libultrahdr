@@ -229,6 +229,8 @@ uhdr_error_info_t JpegDecoderHelper::decompressImage(const void* image, size_t l
   mIsoMetadataBuffer.clear();
   mOutFormat = UHDR_IMG_FMT_UNSPECIFIED;
   mNumComponents = 1;
+  mChromaHorizontalSubsampling = 1;
+  mChromaVerticalSubsampling = 1;
   for (int i = 0; i < kMaxNumComponents; i++) {
     mPlanesMCURow[i].reset();
     mPlaneWidth[i] = 0;
@@ -477,6 +479,22 @@ uhdr_error_info_t JpegDecoderHelper::decode(jpeg_decompress_struct* cinfo, uint8
         status.has_detail = 1;
         snprintf(status.detail, sizeof status.detail,
                  "unrecognized subsampling format for output color space JCS_YCbCr");
+        return status;
+      }
+      if (cinfo->num_components == 3) {
+        const auto& cb = cinfo->comp_info[1];
+        const auto& cr = cinfo->comp_info[2];
+        if (cb.h_samp_factor != cr.h_samp_factor || cb.v_samp_factor != cr.v_samp_factor ||
+            cinfo->max_h_samp_factor % cb.h_samp_factor != 0 ||
+            cinfo->max_v_samp_factor % cb.v_samp_factor != 0) {
+          status.error_code = UHDR_CODEC_ERROR;
+          status.has_detail = 1;
+          snprintf(status.detail, sizeof status.detail,
+                   "JPEG chroma components have incompatible sampling factors");
+          return status;
+        }
+        mChromaHorizontalSubsampling = cinfo->max_h_samp_factor / cb.h_samp_factor;
+        mChromaVerticalSubsampling = cinfo->max_v_samp_factor / cb.v_samp_factor;
       }
       return decodeToCSYCbCr(cinfo, dest);
 #ifdef JCS_ALPHA_EXTENSIONS

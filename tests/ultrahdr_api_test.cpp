@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #endif
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <cstring>
 #include <limits>
@@ -444,6 +445,17 @@ static void expectGainMapsEqual(const uhdr_raw_image_t* expected,
   }
 }
 
+TEST(JpegDecoderDispatchTest, CpuFallbackCoversAllHdrTransfers) {
+  for (uhdr_color_transfer_t transfer : {UHDR_CT_LINEAR, UHDR_CT_HLG, UHDR_CT_PQ}) {
+    EXPECT_FALSE(shouldUseGlesForJpegDecoder(true, transfer, false));
+    EXPECT_FALSE(shouldUseGlesForJpegDecoder(true, transfer, true));
+    EXPECT_FALSE(shouldUseGlesForJpegDecoder(false, transfer, true));
+  }
+  EXPECT_FALSE(shouldUseGlesForJpegDecoder(true, UHDR_CT_SRGB, false));
+  EXPECT_TRUE(shouldUseGlesForJpegDecoder(true, UHDR_CT_SRGB, true));
+  EXPECT_FALSE(shouldUseGlesForJpegDecoder(false, UHDR_CT_SRGB, true));
+}
+
 class UltraHdrApiTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -708,6 +720,67 @@ TEST_F(UltraHdrApiTest, JpegEncodeApi0AndDecode) {
 
   uhdr_release_decoder(dec);
   uhdr_release_encoder(enc);
+}
+
+TEST_F(UltraHdrApiTest, JpegHdrGpuRequestUsesCpuForEffectsAndKeepsOutputBounds) {
+  uhdr_codec_private_t* encoder = uhdr_create_encoder();
+  ASSERT_NE(encoder, nullptr);
+  ASSERT_EQ(uhdr_enc_set_raw_image(encoder, &mHdrRaw, UHDR_HDR_IMG).error_code, UHDR_CODEC_OK);
+  ASSERT_EQ(uhdr_enc_set_output_format(encoder, UHDR_CODEC_JPG).error_code, UHDR_CODEC_OK);
+  ASSERT_EQ(uhdr_enc_set_quality(encoder, 90, UHDR_BASE_IMG).error_code, UHDR_CODEC_OK);
+  ASSERT_EQ(uhdr_enc_set_quality(encoder, 90, UHDR_GAIN_MAP_IMG).error_code, UHDR_CODEC_OK);
+  ASSERT_EQ(uhdr_encode(encoder).error_code, UHDR_CODEC_OK);
+  uhdr_compressed_image_t* encoded = uhdr_get_encoded_stream(encoder);
+  ASSERT_NE(encoded, nullptr);
+
+  std::vector<std::vector<uint16_t>> outputs(2);
+  std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> decoder(
+      uhdr_create_decoder(), uhdr_release_decoder);
+  ASSERT_NE(decoder, nullptr);
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass != 0) uhdr_reset_decoder(decoder.get());
+    const int gpu_requested = pass == 0 ? 1 : 0;
+    ASSERT_EQ(uhdr_dec_set_image(decoder.get(), encoded).error_code, UHDR_CODEC_OK);
+    ASSERT_EQ(
+        uhdr_dec_set_out_img_format(decoder.get(), UHDR_IMG_FMT_64bppRGBAHalfFloat).error_code,
+        UHDR_CODEC_OK);
+    ASSERT_EQ(uhdr_dec_set_out_color_transfer(decoder.get(), UHDR_CT_LINEAR).error_code,
+              UHDR_CODEC_OK);
+    ASSERT_EQ(uhdr_dec_set_out_max_display_boost(decoder.get(), 8.0f).error_code, UHDR_CODEC_OK);
+    ASSERT_EQ(uhdr_enable_gpu_acceleration(decoder.get(), gpu_requested).error_code, UHDR_CODEC_OK);
+    ASSERT_EQ(uhdr_add_effect_rotate(decoder.get(), 90).error_code, UHDR_CODEC_OK);
+    ASSERT_EQ(uhdr_add_effect_crop(decoder.get(), 8, 712, 8, 1272).error_code, UHDR_CODEC_OK);
+    ASSERT_EQ(uhdr_add_effect_resize(decoder.get(), 640, 480).error_code, UHDR_CODEC_OK);
+    ASSERT_EQ(uhdr_decode(decoder.get()).error_code, UHDR_CODEC_OK);
+
+    uhdr_raw_image_t* decoded = uhdr_get_decoded_image(decoder.get());
+    ASSERT_NE(decoded, nullptr);
+    ASSERT_EQ(decoded->fmt, UHDR_IMG_FMT_64bppRGBAHalfFloat);
+    ASSERT_EQ(decoded->w, 640u);
+    ASSERT_EQ(decoded->h, 480u);
+    const auto* pixels = static_cast<const uint16_t*>(decoded->planes[UHDR_PLANE_PACKED]);
+    ASSERT_NE(pixels, nullptr);
+    outputs[pass].resize(static_cast<size_t>(decoded->w) * decoded->h * 4);
+    for (unsigned int y = 0; y < decoded->h; ++y) {
+      const uint16_t* row =
+          pixels + static_cast<size_t>(y) * decoded->stride[UHDR_PLANE_PACKED] * 4;
+      std::memcpy(outputs[pass].data() + static_cast<size_t>(y) * decoded->w * 4, row,
+                  static_cast<size_t>(decoded->w) * 4 * sizeof(uint16_t));
+      for (unsigned int x = 0; x < decoded->w; ++x) {
+        const size_t index = static_cast<size_t>(y) * decoded->w * 4 + x * 4;
+        for (int channel = 0; channel < 3; ++channel) {
+          const float value = halfToFloat(outputs[pass][index + channel]);
+          EXPECT_TRUE(std::isfinite(value));
+          EXPECT_GE(value, 0.0f);
+          EXPECT_LE(value, kMaxPixelFloatHdrLinear);
+        }
+        EXPECT_FLOAT_EQ(halfToFloat(outputs[pass][index + 3]), 1.0f);
+      }
+    }
+  }
+  EXPECT_EQ(outputs[0].size(), outputs[1].size());
+  EXPECT_EQ(outputs[0], outputs[1]);
+  uhdr_release_encoder(encoder);
 }
 
 TEST_F(UltraHdrApiTest, JpegEncodeApi1AndDecode) {

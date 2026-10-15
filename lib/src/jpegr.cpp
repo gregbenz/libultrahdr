@@ -1560,16 +1560,19 @@ uhdr_error_info_t JpegR::decodeJPEGR(uhdr_compressed_image_t* uhdr_compressed_im
   }
 
   UHDR_ERR_CHECK(applyGainMap(&sdr_intent, &gainmap, &uhdr_metadata, output_ct, output_format,
-                              max_display_boost, dest));
+                              max_display_boost, dest, true,
+                              jpeg_dec_obj_sdr.getChromaHorizontalSubsamplingFactor(),
+                              jpeg_dec_obj_sdr.getChromaVerticalSubsamplingFactor()));
 
   return g_no_error;
 }
 
-uhdr_error_info_t UltraHdr::applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_image_t* gainmap_img,
-                                      uhdr_gainmap_metadata_ext_t* gainmap_metadata,
-                                      uhdr_color_transfer_t output_ct,
-                                      [[maybe_unused]] uhdr_img_fmt_t output_format,
-                                      float max_display_boost, uhdr_raw_image_t* dest) {
+uhdr_error_info_t UltraHdr::applyGainMap(
+    uhdr_raw_image_t* sdr_intent, uhdr_raw_image_t* gainmap_img,
+    uhdr_gainmap_metadata_ext_t* gainmap_metadata, uhdr_color_transfer_t output_ct,
+    [[maybe_unused]] uhdr_img_fmt_t output_format, float max_display_boost, uhdr_raw_image_t* dest,
+    bool use_jpeg_centered_base_sampling, unsigned int jpeg_chroma_horizontal_subsampling,
+    unsigned int jpeg_chroma_vertical_subsampling) {
   if (dest == nullptr || dest->planes[UHDR_PLANE_PACKED] == nullptr) {
     uhdr_error_info_t status;
     status.error_code = UHDR_CODEC_INVALID_PARAM;
@@ -1675,7 +1678,7 @@ uhdr_error_info_t UltraHdr::applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_
   }
 
 #ifdef UHDR_ENABLE_GLES
-  if (mUhdrGLESCtxt != nullptr) {
+  if (mUhdrGLESCtxt != nullptr && !use_jpeg_centered_base_sampling) {
     if (((sdr_intent->fmt == UHDR_IMG_FMT_12bppYCbCr420 && sdr_intent->w % 2 == 0 &&
           sdr_intent->h % 2 == 0) ||
          (sdr_intent->fmt == UHDR_IMG_FMT_16bppYCbCr422 && sdr_intent->w % 2 == 0) ||
@@ -1744,13 +1747,14 @@ uhdr_error_info_t UltraHdr::applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_
   }
 
   JobQueue jobQueue;
-  std::function<void()> applyRecMap = [sdr_intent, gainmap_img, dest, &jobQueue, &idwTable,
-                                       output_ct, &gainLUT, gainmap_metadata, hdrGamutConversionFn,
-                                       sdrGamutConversionFn,
+  std::function<void()> applyRecMap =
+      [sdr_intent, gainmap_img, dest, &jobQueue, &idwTable, output_ct, &gainLUT, gainmap_metadata,
+       hdrGamutConversionFn, sdrGamutConversionFn,
 #if !USE_APPLY_GAIN_LUT
-                                       gainmap_weight,
+       gainmap_weight,
 #endif
-                                       map_scale_factor, get_pixel_fn]() -> void {
+       map_scale_factor, get_pixel_fn, use_jpeg_centered_base_sampling,
+       jpeg_chroma_horizontal_subsampling, jpeg_chroma_vertical_subsampling]() -> void {
     unsigned int width = sdr_intent->w;
     unsigned int rowStart, rowEnd;
     const bool isSdrIntentRgb = isPixelFormatRgb(sdr_intent->fmt);
@@ -1760,7 +1764,12 @@ uhdr_error_info_t UltraHdr::applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_
         for (size_t x = 0; x < width; ++x) {
           Color rgb_gamma_sdr;
 
-          if (isSdrIntentRgb) {
+          if (use_jpeg_centered_base_sampling && !isSdrIntentRgb) {
+            const Color yuv_gamma_sdr =
+                getJpegYuvCenteredPixel(sdr_intent, x, y, jpeg_chroma_horizontal_subsampling,
+                                        jpeg_chroma_vertical_subsampling);
+            rgb_gamma_sdr = p3YuvToRgbUnclamped(yuv_gamma_sdr);
+          } else if (isSdrIntentRgb) {
             rgb_gamma_sdr = get_pixel_fn(sdr_intent, x, y);
           } else {
             Color yuv_gamma_sdr = get_pixel_fn(sdr_intent, x, y);
@@ -1768,9 +1777,13 @@ uhdr_error_info_t UltraHdr::applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_
           }
           // We are assuming the SDR base image is always sRGB transfer.
 #if USE_SRGB_INVOETF_LUT
-          Color rgb_sdr = srgbInvOetfLUT(rgb_gamma_sdr);
+          Color rgb_sdr = use_jpeg_centered_base_sampling && !isSdrIntentRgb
+                              ? srgbInvOetfExtendedLUT(rgb_gamma_sdr)
+                              : srgbInvOetfLUT(rgb_gamma_sdr);
 #else
-          Color rgb_sdr = srgbInvOetf(rgb_gamma_sdr);
+          Color rgb_sdr = use_jpeg_centered_base_sampling && !isSdrIntentRgb
+                              ? srgbInvOetfExtended(rgb_gamma_sdr)
+                              : srgbInvOetf(rgb_gamma_sdr);
 #endif
           rgb_sdr = sdrGamutConversionFn(rgb_sdr);
           Color rgb_hdr;

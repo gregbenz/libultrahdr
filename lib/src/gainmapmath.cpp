@@ -8,6 +8,7 @@
  * except according to those terms.
  */
 
+#include <algorithm>
 #include <cmath>
 
 #include "ultrahdr/gainmapmath.h"
@@ -123,6 +124,18 @@ Color srgbInvOetf(Color e_gamma) {
   return {{{srgbInvOetf(e_gamma.r), srgbInvOetf(e_gamma.g), srgbInvOetf(e_gamma.b)}}};
 }
 
+float srgbInvOetfExtended(float e_gamma) {
+  const float magnitude = std::fabs(e_gamma);
+  const float decoded =
+      magnitude <= 0.04045f ? magnitude / 12.92f : std::pow((magnitude + 0.055f) / 1.055f, 2.4f);
+  return std::copysign(decoded, e_gamma);
+}
+
+Color srgbInvOetfExtended(Color e_gamma) {
+  return {{{srgbInvOetfExtended(e_gamma.r), srgbInvOetfExtended(e_gamma.g),
+            srgbInvOetfExtended(e_gamma.b)}}};
+}
+
 float srgbInvOetfLUT(float e_gamma) {
   int32_t value = static_cast<int32_t>(e_gamma * (kSrgbInvOETFNumEntries - 1) + 0.5);
   // TODO() : Remove once conversion modules have appropriate clamping in place
@@ -139,6 +152,26 @@ Color srgbInvOetfLUT(Color e_gamma) {
     return CLIP3(lut_index, 0, kSrgbInvOETFNumEntries - 1);
   };
   return {{{lut[index(e_gamma.r)], lut[index(e_gamma.g)], lut[index(e_gamma.b)]}}};
+}
+
+float srgbInvOetfExtendedLUT(float e_gamma) {
+  if (!std::isfinite(e_gamma) || std::fabs(e_gamma) > 1.0f) {
+    return srgbInvOetfExtended(e_gamma);
+  }
+
+  static const LookUpTable kExtendedSrgbInvOETF(kSrgbInvOETFNumEntries,
+                                                static_cast<float (*)(float)>(srgbInvOetf));
+  const std::vector<float>& table = kExtendedSrgbInvOETF.getTable();
+  const float position = std::fabs(e_gamma) * static_cast<float>(table.size() - 1);
+  const size_t lower = std::min(static_cast<size_t>(position), table.size() - 2);
+  const float fraction = position - static_cast<float>(lower);
+  const float decoded = table[lower] + (table[lower + 1] - table[lower]) * fraction;
+  return std::copysign(decoded, e_gamma);
+}
+
+Color srgbInvOetfExtendedLUT(Color e_gamma) {
+  return {{{srgbInvOetfExtendedLUT(e_gamma.r), srgbInvOetfExtendedLUT(e_gamma.g),
+            srgbInvOetfExtendedLUT(e_gamma.b)}}};
 }
 
 // See IEC 61966-2-1/Amd 1:2003, Equations F.10 and F.11.
@@ -184,6 +217,11 @@ Color p3YuvToRgb(Color e_gamma) {
   return {{{clampPixelFloat(e_gamma.y + kP3Cr * e_gamma.v),
             clampPixelFloat(e_gamma.y - kP3GCb * e_gamma.u - kP3GCr * e_gamma.v),
             clampPixelFloat(e_gamma.y + kP3Cb * e_gamma.u)}}};
+}
+
+Color p3YuvToRgbUnclamped(Color e_gamma) {
+  return {{{e_gamma.y + kP3Cr * e_gamma.v, e_gamma.y - kP3GCb * e_gamma.u - kP3GCr * e_gamma.v,
+            e_gamma.y + kP3Cb * e_gamma.u}}};
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -390,6 +428,49 @@ Color getYuv422Pixel(uhdr_raw_image_t* image, size_t x, size_t y) {
 
 Color getYuv420Pixel(uhdr_raw_image_t* image, size_t x, size_t y) {
   return getYuv4abPixel(image, x, y, 2, 2);
+}
+
+Color getJpegYuvCenteredPixel(uhdr_raw_image_t* image, size_t x, size_t y,
+                              unsigned int horizontal_subsampling,
+                              unsigned int vertical_subsampling) {
+  if (image == nullptr || image->planes[UHDR_PLANE_Y] == nullptr ||
+      image->planes[UHDR_PLANE_U] == nullptr || image->planes[UHDR_PLANE_V] == nullptr ||
+      horizontal_subsampling == 0 || vertical_subsampling == 0 || image->w == 0 || image->h == 0) {
+    return {};
+  }
+
+  const auto sample_coordinate = [](size_t coordinate, unsigned int subsampling,
+                                    unsigned int extent) {
+    const float centered =
+        (static_cast<float>(coordinate) + 0.5f) / static_cast<float>(subsampling) - 0.5f;
+    return std::clamp(centered, 0.0f, static_cast<float>(extent - 1));
+  };
+  const size_t chroma_width = (image->w + horizontal_subsampling - 1) / horizontal_subsampling;
+  const size_t chroma_height = (image->h + vertical_subsampling - 1) / vertical_subsampling;
+  const float chroma_x = sample_coordinate(x, horizontal_subsampling, chroma_width);
+  const float chroma_y = sample_coordinate(y, vertical_subsampling, chroma_height);
+  const size_t x0 = static_cast<size_t>(chroma_x);
+  const size_t y0 = static_cast<size_t>(chroma_y);
+  const size_t x1 = std::min(x0 + 1, chroma_width - 1);
+  const size_t y1 = std::min(y0 + 1, chroma_height - 1);
+  const float x_weight = chroma_x - static_cast<float>(x0);
+  const float y_weight = chroma_y - static_cast<float>(y0);
+
+  const auto interpolate_plane = [x0, x1, y0, y1, x_weight, y_weight](const uint8_t* plane,
+                                                                      size_t stride) {
+    const float top = static_cast<float>(plane[y0 * stride + x0]) * (1.0f - x_weight) +
+                      static_cast<float>(plane[y0 * stride + x1]) * x_weight;
+    const float bottom = static_cast<float>(plane[y1 * stride + x0]) * (1.0f - x_weight) +
+                         static_cast<float>(plane[y1 * stride + x1]) * x_weight;
+    return (top * (1.0f - y_weight) + bottom * y_weight - 128.0f) / 255.0f;
+  };
+
+  const auto* luma = static_cast<const uint8_t*>(image->planes[UHDR_PLANE_Y]);
+  const auto* cb = static_cast<const uint8_t*>(image->planes[UHDR_PLANE_U]);
+  const auto* cr = static_cast<const uint8_t*>(image->planes[UHDR_PLANE_V]);
+  const float y_value = static_cast<float>(luma[y * image->stride[UHDR_PLANE_Y] + x]) / 255.0f;
+  return {{{y_value, interpolate_plane(cb, image->stride[UHDR_PLANE_U]),
+            interpolate_plane(cr, image->stride[UHDR_PLANE_V])}}};
 }
 
 Color getYuv400Pixel(uhdr_raw_image_t* image, size_t x, size_t y) {

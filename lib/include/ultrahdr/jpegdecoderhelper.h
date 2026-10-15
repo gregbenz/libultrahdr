@@ -101,6 +101,10 @@ class JpegDecoderHelper {
   /*!\brief returns number of components in image */
   unsigned int getNumComponentsInImage() { return mNumComponents; }
 
+  /*!\brief returns JPEG chroma factors relative to luma after YCbCr decompression */
+  unsigned int getChromaHorizontalSubsamplingFactor() { return mChromaHorizontalSubsampling; }
+  unsigned int getChromaVerticalSubsamplingFactor() { return mChromaVerticalSubsampling; }
+
   /*!\brief returns pointer to xmp block present in input image */
   void* getXMPPtr() { return mXMPBuffer.data(); }
 
@@ -156,6 +160,8 @@ class JpegDecoderHelper {
   unsigned int mPlaneHeight[kMaxNumComponents];
   unsigned int mPlaneHStride[kMaxNumComponents];
   unsigned int mPlaneVStride[kMaxNumComponents];
+  unsigned int mChromaHorizontalSubsampling = 1;
+  unsigned int mChromaVerticalSubsampling = 1;
 
   long mExifPayLoadOffset;  // Position of EXIF package, default value is -1 which means no EXIF
                             // package appears.

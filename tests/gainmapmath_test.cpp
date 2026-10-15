@@ -821,6 +821,29 @@ TEST_F(GainMapMathTest, SrgbTransferFunction) {
   EXPECT_FLOAT_EQ(srgbInvOetf(1.0f), 1.0f);
 }
 
+TEST_F(GainMapMathTest, ExtendedSrgbInverseTransferUsesSignedOddExtension) {
+  const auto oracle = [](float value) {
+    const float magnitude = std::fabs(value);
+    const float decoded =
+        magnitude <= 0.04045f ? magnitude / 12.92f : std::pow((magnitude + 0.055f) / 1.055f, 2.4f);
+    return std::copysign(decoded, value);
+  };
+
+  for (float value :
+       {-2.0f, -1.25f, -0.5f, -0.1f, -0.04045f, 0.0f, 0.04045f, 0.1f, 0.5f, 1.0f, 1.25f, 2.0f}) {
+    EXPECT_NEAR(srgbInvOetfExtended(value), oracle(value), 1e-7f);
+    EXPECT_NEAR(srgbInvOetfExtendedLUT(value), oracle(value), 1e-6f);
+  }
+
+  for (int index = 0; index <= 4096; ++index) {
+    const float value = -1.0f + static_cast<float>(index) / 2048.0f;
+    EXPECT_NEAR(srgbInvOetfExtendedLUT(value), oracle(value), 1e-6f);
+  }
+
+  EXPECT_NEAR(srgbInvOetfExtended(-0.5f), -0.21404114f, 1e-7f);
+  EXPECT_NEAR(srgbInvOetfExtended(-0.1f), -0.010022826f, 1e-8f);
+}
+
 TEST_F(GainMapMathTest, P3Luminance) {
   EXPECT_FLOAT_EQ(p3Luminance(RgbBlack()), 0.0f);
   EXPECT_FLOAT_EQ(p3Luminance(RgbWhite()), 1.0f);
@@ -844,6 +867,121 @@ TEST_F(GainMapMathTest, P3YuvToRgb) {
 
   Color rgb_b = p3YuvToRgb(P3YuvBlue());
   EXPECT_RGB_NEAR(rgb_b, RgbBlue());
+}
+
+TEST_F(GainMapMathTest, P3YuvToRgbUnclampedPreservesEncodedExcursions) {
+  const Color negative_yuv = {{{0.1f, 0.3f, 0.4f}}};
+  const Color negative_unclamped = p3YuvToRgbUnclamped(negative_yuv);
+  const Color negative_clipped = p3YuvToRgb(negative_yuv);
+  EXPECT_NEAR(negative_unclamped.r, 0.1f + 1.402f * 0.4f, 1e-7f);
+  EXPECT_LT(negative_unclamped.g, 0.0f);
+  EXPECT_NEAR(negative_unclamped.b, 0.1f + 1.772f * 0.3f, 1e-7f);
+  EXPECT_FLOAT_EQ(negative_clipped.g, 0.0f);
+
+  const Color high_yuv = {{{0.8f, 0.3f, 0.4f}}};
+  const Color high_unclamped = p3YuvToRgbUnclamped(high_yuv);
+  const Color high_clipped = p3YuvToRgb(high_yuv);
+  EXPECT_GT(high_unclamped.r, 1.0f);
+  EXPECT_GT(high_unclamped.b, 1.0f);
+  EXPECT_FLOAT_EQ(high_clipped.r, 1.0f);
+  EXPECT_FLOAT_EQ(high_clipped.b, 1.0f);
+}
+
+TEST_F(GainMapMathTest, JpegCenteredChromaUsesFactorsOddDimensionsAndPaddedStrides) {
+  constexpr size_t kWidth = 5;
+  constexpr size_t kHeight = 3;
+  constexpr size_t kLumaStride = 7;
+  constexpr size_t kChromaStride = 5;
+  std::array<uint8_t, kLumaStride * kHeight> luma{};
+  std::array<uint8_t, kChromaStride * kHeight> cb{};
+  std::array<uint8_t, kChromaStride * kHeight> cr{};
+  luma.fill(99);
+  cb.fill(251);
+  cr.fill(3);
+  for (size_t y = 0; y < kHeight; ++y) {
+    for (size_t x = 0; x < kWidth; ++x) {
+      luma[y * kLumaStride + x] = static_cast<uint8_t>(20 + x + y * 7);
+    }
+  }
+
+  uhdr_raw_image_t image{};
+  image.w = kWidth;
+  image.h = kHeight;
+  image.planes[UHDR_PLANE_Y] = luma.data();
+  image.planes[UHDR_PLANE_U] = cb.data();
+  image.planes[UHDR_PLANE_V] = cr.data();
+  image.stride[UHDR_PLANE_Y] = kLumaStride;
+  image.stride[UHDR_PLANE_U] = kChromaStride;
+  image.stride[UHDR_PLANE_V] = kChromaStride;
+
+  const auto oracle_sample = [](const std::array<uint8_t, kChromaStride * kHeight>& plane, size_t x,
+                                size_t y, unsigned int horizontal_subsampling,
+                                unsigned int vertical_subsampling) {
+    const size_t width = (kWidth + horizontal_subsampling - 1) / horizontal_subsampling;
+    const size_t height = (kHeight + vertical_subsampling - 1) / vertical_subsampling;
+    const double chroma_x =
+        std::clamp((static_cast<double>(x) + 0.5) / horizontal_subsampling - 0.5, 0.0,
+                   static_cast<double>(width - 1));
+    const double chroma_y = std::clamp((static_cast<double>(y) + 0.5) / vertical_subsampling - 0.5,
+                                       0.0, static_cast<double>(height - 1));
+    const size_t x0 = static_cast<size_t>(chroma_x);
+    const size_t y0 = static_cast<size_t>(chroma_y);
+    const size_t x1 = std::min(x0 + 1, width - 1);
+    const size_t y1 = std::min(y0 + 1, height - 1);
+    const double fx = chroma_x - x0;
+    const double fy = chroma_y - y0;
+    const double top =
+        plane[y0 * kChromaStride + x0] * (1.0 - fx) + plane[y0 * kChromaStride + x1] * fx;
+    const double bottom =
+        plane[y1 * kChromaStride + x0] * (1.0 - fx) + plane[y1 * kChromaStride + x1] * fx;
+    return static_cast<float>((top * (1.0 - fy) + bottom * fy - 128.0) / 255.0);
+  };
+
+  for (const auto [horizontal_subsampling, vertical_subsampling] :
+       {std::pair<unsigned int, unsigned int>{1, 1}, {2, 1}, {2, 2}}) {
+    const size_t chroma_width = (kWidth + horizontal_subsampling - 1) / horizontal_subsampling;
+    const size_t chroma_height = (kHeight + vertical_subsampling - 1) / vertical_subsampling;
+    for (size_t y = 0; y < chroma_height; ++y) {
+      for (size_t x = 0; x < chroma_width; ++x) {
+        cb[y * kChromaStride + x] = static_cast<uint8_t>(128 + x * 9 + y * 17);
+        cr[y * kChromaStride + x] = static_cast<uint8_t>(128 - x * 7 + y * 11);
+      }
+    }
+
+    for (size_t y = 0; y < kHeight; ++y) {
+      for (size_t x = 0; x < kWidth; ++x) {
+        const Color actual =
+            getJpegYuvCenteredPixel(&image, x, y, horizontal_subsampling, vertical_subsampling);
+        EXPECT_NEAR(actual.y, luma[y * kLumaStride + x] / 255.0f, 1e-7f);
+        EXPECT_NEAR(actual.u, oracle_sample(cb, x, y, horizontal_subsampling, vertical_subsampling),
+                    1e-6f);
+        EXPECT_NEAR(actual.v, oracle_sample(cr, x, y, horizontal_subsampling, vertical_subsampling),
+                    1e-6f);
+      }
+    }
+
+    // Values placed in padding must never be sampled at the right or bottom edge.
+    const Color edge = getJpegYuvCenteredPixel(&image, kWidth - 1, kHeight - 1,
+                                               horizontal_subsampling, vertical_subsampling);
+    EXPECT_NEAR(
+        edge.u,
+        oracle_sample(cb, kWidth - 1, kHeight - 1, horizontal_subsampling, vertical_subsampling),
+        1e-6f);
+  }
+
+  std::array<uint8_t, 1> one_luma{64};
+  std::array<uint8_t, 1> one_cb{130};
+  std::array<uint8_t, 1> one_cr{126};
+  image.w = 1;
+  image.h = 1;
+  image.planes[UHDR_PLANE_Y] = one_luma.data();
+  image.planes[UHDR_PLANE_U] = one_cb.data();
+  image.planes[UHDR_PLANE_V] = one_cr.data();
+  image.stride[UHDR_PLANE_Y] = image.stride[UHDR_PLANE_U] = image.stride[UHDR_PLANE_V] = 1;
+  const Color one_pixel = getJpegYuvCenteredPixel(&image, 0, 0, 2, 2);
+  EXPECT_NEAR(one_pixel.y, 64.0f / 255.0f, 1e-7f);
+  EXPECT_NEAR(one_pixel.u, 2.0f / 255.0f, 1e-7f);
+  EXPECT_NEAR(one_pixel.v, -2.0f / 255.0f, 1e-7f);
 }
 
 TEST_F(GainMapMathTest, P3RgbToYuv) {

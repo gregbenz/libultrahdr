@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -86,6 +87,48 @@ static bool loadFile(const char filename[], JpegDecoderHelperTest::Image* result
     }
   }
   return false;
+}
+
+static std::vector<uint8_t> makeOddSamplingJpeg(int horizontal_subsampling,
+                                                int vertical_subsampling) {
+  jpeg_compress_struct encoder{};
+  jpeg_error_mgr error_manager{};
+  encoder.err = jpeg_std_error(&error_manager);
+  jpeg_create_compress(&encoder);
+
+  unsigned char* encoded_data = nullptr;
+  unsigned long encoded_size = 0;
+  jpeg_mem_dest(&encoder, &encoded_data, &encoded_size);
+  encoder.image_width = 5;
+  encoder.image_height = 3;
+  encoder.input_components = 3;
+  encoder.in_color_space = JCS_RGB;
+  jpeg_set_defaults(&encoder);
+  encoder.comp_info[0].h_samp_factor = horizontal_subsampling;
+  encoder.comp_info[0].v_samp_factor = vertical_subsampling;
+  encoder.comp_info[1].h_samp_factor = 1;
+  encoder.comp_info[1].v_samp_factor = 1;
+  encoder.comp_info[2].h_samp_factor = 1;
+  encoder.comp_info[2].v_samp_factor = 1;
+  jpeg_set_quality(&encoder, 100, TRUE);
+  jpeg_start_compress(&encoder, TRUE);
+
+  std::vector<JSAMPLE> row(static_cast<size_t>(encoder.image_width) * 3);
+  while (encoder.next_scanline < encoder.image_height) {
+    for (size_t x = 0; x < encoder.image_width; ++x) {
+      row[x * 3] = static_cast<JSAMPLE>(x * 40);
+      row[x * 3 + 1] = static_cast<JSAMPLE>(encoder.next_scanline * 70);
+      row[x * 3 + 2] = static_cast<JSAMPLE>((x + encoder.next_scanline) * 25);
+    }
+    JSAMPROW row_ptr = row.data();
+    jpeg_write_scanlines(&encoder, &row_ptr, 1);
+  }
+  jpeg_finish_compress(&encoder);
+  jpeg_destroy_compress(&encoder);
+
+  std::vector<uint8_t> result(encoded_data, encoded_data + encoded_size);
+  std::free(encoded_data);
+  return result;
 }
 
 struct JpegSegment {
@@ -228,6 +271,45 @@ TEST_F(JpegDecoderHelperTest, decodeYuvImage) {
   ASSERT_GT(decoder.getDecompressedImageSize(), static_cast<uint32_t>(0));
   EXPECT_EQ(IccHelper::readIccColorGamut(decoder.getICCPtr(), decoder.getICCSize()),
             UHDR_CG_UNSPECIFIED);
+}
+
+TEST_F(JpegDecoderHelperTest, exposesJpegSamplingFactorsForOddDimensions) {
+  struct SamplingCase {
+    int horizontal_factor;
+    int vertical_factor;
+    unsigned int expected_horizontal_subsampling;
+    unsigned int expected_vertical_subsampling;
+    uhdr_img_fmt_t expected_format;
+  };
+  const SamplingCase cases[] = {
+      {1, 1, 1, 1, UHDR_IMG_FMT_24bppYCbCr444},
+      {2, 1, 2, 1, UHDR_IMG_FMT_16bppYCbCr422},
+      {2, 2, 2, 2, UHDR_IMG_FMT_12bppYCbCr420},
+  };
+
+  for (const SamplingCase& test_case : cases) {
+    SCOPED_TRACE(testing::Message()
+                 << test_case.horizontal_factor << "x" << test_case.vertical_factor);
+    const std::vector<uint8_t> jpeg =
+        makeOddSamplingJpeg(test_case.horizontal_factor, test_case.vertical_factor);
+    JpegDecoderHelper decoder;
+    ASSERT_EQ(decoder.decompressImage(jpeg.data(), jpeg.size()).error_code, UHDR_CODEC_OK);
+
+    EXPECT_EQ(decoder.getChromaHorizontalSubsamplingFactor(),
+              test_case.expected_horizontal_subsampling);
+    EXPECT_EQ(decoder.getChromaVerticalSubsamplingFactor(),
+              test_case.expected_vertical_subsampling);
+    const uhdr_raw_image_t decoded = decoder.getDecompressedImage();
+    EXPECT_EQ(decoded.w, 5u);
+    EXPECT_EQ(decoded.h, 3u);
+    EXPECT_EQ(decoded.fmt, test_case.expected_format);
+    EXPECT_GE(decoded.stride[UHDR_PLANE_U],
+              (decoded.w + test_case.expected_horizontal_subsampling - 1) /
+                  test_case.expected_horizontal_subsampling);
+    EXPECT_GE(decoded.stride[UHDR_PLANE_V],
+              (decoded.w + test_case.expected_horizontal_subsampling - 1) /
+                  test_case.expected_horizontal_subsampling);
+  }
 }
 
 TEST_F(JpegDecoderHelperTest, decodeYuvImageToRgba) {

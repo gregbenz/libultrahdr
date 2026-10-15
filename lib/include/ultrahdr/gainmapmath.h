@@ -267,6 +267,13 @@ Color srgbInvOetf(Color e_gamma);
 float srgbInvOetfLUT(float e_gamma);
 Color srgbInvOetfLUT(Color e_gamma);
 
+// Decoder-only extended-range conversions. These preserve JPEG reconstruction excursions until
+// the declared output-boundary clamp and do not change encoder behavior.
+float srgbInvOetfExtended(float e_gamma);
+Color srgbInvOetfExtended(Color e_gamma);
+float srgbInvOetfExtendedLUT(float e_gamma);
+Color srgbInvOetfExtendedLUT(Color e_gamma);
+
 // sRGB oetf
 float srgbOetf(float e);
 Color srgbOetf(Color e);
@@ -284,6 +291,7 @@ float p3Luminance(Color e);
 // DispP3 rgb <-> yuv  conversion
 Color p3RgbToYuv(Color e_gamma);
 Color p3YuvToRgb(Color e_gamma);
+Color p3YuvToRgbUnclamped(Color e_gamma);
 
 ////////////////////////////////////////////////////////////////////////////////
 // BT.2100 transformations
@@ -363,6 +371,11 @@ class LookUpTable {
 Color getYuv444Pixel(uhdr_raw_image_t* image, size_t x, size_t y);
 Color getYuv422Pixel(uhdr_raw_image_t* image, size_t x, size_t y);
 Color getYuv420Pixel(uhdr_raw_image_t* image, size_t x, size_t y);
+// JPEG decoder-only chroma reconstruction using the encoded sampling factors and centered
+// bilinear interpolation. Plane strides may include padding beyond the logical dimensions.
+Color getJpegYuvCenteredPixel(uhdr_raw_image_t* image, size_t x, size_t y,
+                              unsigned int horizontal_subsampling,
+                              unsigned int vertical_subsampling);
 Color getYuv400Pixel(uhdr_raw_image_t* image, size_t x, size_t y);
 Color getP010Pixel(uhdr_raw_image_t* image, size_t x, size_t y);
 Color getYuv444Pixel10bit(uhdr_raw_image_t* image, size_t x, size_t y);

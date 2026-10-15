@@ -287,10 +287,15 @@ bool is_resize_effect(const ultrahdr::uhdr_effect_desc_t* effect) {
   return dynamic_cast<const ultrahdr::uhdr_resize_effect_t*>(effect) != nullptr;
 }
 
-uhdr_error_info_t apply_effects(uhdr_decoder_private* dec) {
+bool shouldUseGlesForJpegDecoder(bool requested, uhdr_color_transfer_t output_transfer,
+                                 bool has_effects) {
+  return requested && output_transfer == UHDR_CT_SRGB && has_effects;
+}
+
+uhdr_error_info_t apply_effects(uhdr_decoder_private* dec, [[maybe_unused]] bool use_gles) {
   void *gl_ctxt = nullptr, *disp_texture_ptr = nullptr, *gm_texture_ptr = nullptr;
 #ifdef UHDR_ENABLE_GLES
-  if (dec->m_enable_gles) {
+  if (use_gles) {
     gl_ctxt = &dec->m_uhdr_gl_ctxt;
     bool texture_created =
         dec->m_uhdr_gl_ctxt.mDecodedImgTexture != 0 && dec->m_uhdr_gl_ctxt.mGainmapImgTexture != 0;
@@ -2231,9 +2236,9 @@ uhdr_error_info_t uhdr_decode(uhdr_codec_private_t* dec) {
       handle->m_gainmap_ht, 1);
 
 #ifdef UHDR_ENABLE_HEIF
-  enum heif_filetype_result filetype = heif_check_filetype(
-      static_cast<const uint8_t*>(handle->m_uhdr_compressed_img->data),
-      handle->m_uhdr_compressed_img->data_sz);
+  enum heif_filetype_result filetype =
+      heif_check_filetype(static_cast<const uint8_t*>(handle->m_uhdr_compressed_img->data),
+                          handle->m_uhdr_compressed_img->data_sz);
   if (filetype == heif_filetype_yes_supported || filetype == heif_filetype_maybe) {
     ultrahdr::HeifUltraHdr heifApp;
     status = heifApp.decodeHeicUltraHdr(
@@ -2241,16 +2246,22 @@ uhdr_error_info_t uhdr_decode(uhdr_codec_private_t* dec) {
         handle->m_output_max_disp_boost, handle->m_output_ct, handle->m_output_fmt,
         handle->m_gainmap_img_buffer.get(), nullptr);
     if (status.error_code == UHDR_CODEC_OK && dec->m_effects.size() != 0) {
-      status = ultrahdr::apply_effects(handle);
+      bool use_gles = false;
+#ifdef UHDR_ENABLE_GLES
+      use_gles = handle->m_enable_gles;
+#endif
+      status = ultrahdr::apply_effects(handle, use_gles);
     }
     return status;
   }
 #endif
 
+  bool use_gles = false;
 #ifdef UHDR_ENABLE_GLES
+  use_gles = ultrahdr::shouldUseGlesForJpegDecoder(handle->m_enable_gles, handle->m_output_ct,
+                                                   !handle->m_effects.empty());
   ultrahdr::uhdr_opengl_ctxt_t* uhdrGLESCtxt = nullptr;
-  if (handle->m_enable_gles &&
-      (handle->m_output_ct != UHDR_CT_SRGB || handle->m_effects.size() > 0)) {
+  if (use_gles) {
     handle->m_uhdr_gl_ctxt.init_opengl_ctxt();
     status = handle->m_uhdr_gl_ctxt.mErrorStatus;
     if (status.error_code != UHDR_CODEC_OK) return status;
@@ -2267,11 +2278,11 @@ uhdr_error_info_t uhdr_decode(uhdr_codec_private_t* dec) {
                         handle->m_gainmap_img_buffer.get(), nullptr);
 
   if (status.error_code == UHDR_CODEC_OK && dec->m_effects.size() != 0) {
-    status = ultrahdr::apply_effects(handle);
+    status = ultrahdr::apply_effects(handle, use_gles);
   }
 
 #ifdef UHDR_ENABLE_GLES
-  if (handle->m_enable_gles) {
+  if (use_gles) {
     if (handle->m_uhdr_gl_ctxt.mDecodedImgTexture != 0) {
       handle->m_uhdr_gl_ctxt.read_texture(
           &handle->m_uhdr_gl_ctxt.mDecodedImgTexture, handle->m_decoded_img_buffer->fmt,

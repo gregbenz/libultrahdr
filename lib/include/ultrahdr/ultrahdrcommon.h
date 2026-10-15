@@ -351,6 +351,11 @@ bool isBufferDataContiguous(uhdr_raw_image_t* img);
 
 uhdr_error_info_t uhdr_validate_gainmap_metadata_descriptor(uhdr_gainmap_metadata_t* metadata);
 
+// JPEG HDR reconstruction currently has no GLES implementation that matches centered chroma
+// sampling and extended-range base conversion. SDR JPEG effects retain best-effort GLES support.
+bool shouldUseGlesForJpegDecoder(bool requested, uhdr_color_transfer_t output_transfer,
+                                 bool has_effects);
+
 }  // namespace ultrahdr
 
 // ===============================================================================================
@@ -534,7 +539,10 @@ class UltraHdr {
   uhdr_error_info_t applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_image_t* gainmap_img,
                                  uhdr_gainmap_metadata_ext_t* gainmap_metadata,
                                  uhdr_color_transfer_t output_ct, uhdr_img_fmt_t output_format,
-                                 float max_display_boost, uhdr_raw_image_t* dest);
+                                 float max_display_boost, uhdr_raw_image_t* dest,
+                                 bool use_jpeg_centered_base_sampling = false,
+                                 unsigned int jpeg_chroma_horizontal_subsampling = 1,
+                                 unsigned int jpeg_chroma_vertical_subsampling = 1);
 
   /*!\brief This method is used to convert a raw image from one gamut space to another gamut space
    * in-place.
