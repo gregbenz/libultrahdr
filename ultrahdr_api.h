@@ -282,6 +282,14 @@ typedef struct uhdr_gainmap_metadata {
   int use_base_cg;         /**< Is gainmap application space same as base image color space */
 } uhdr_gainmap_metadata_t; /**< alias for struct uhdr_gainmap_metadata */
 
+/**\brief Compressed JPEG gain-map export. */
+typedef struct uhdr_gainmap_export {
+  uhdr_compressed_image_t image; /**< JPEG-encoded gain-map image, not the JPEG-R container */
+  uhdr_gainmap_metadata_t metadata; /**< Metadata associated with image */
+  unsigned int width;  /**< Exported gain-map width in source coordinates */
+  unsigned int height; /**< Exported gain-map height in source coordinates */
+} uhdr_gainmap_export_t;
+
 /**\brief ultrahdr codec context opaque descriptor */
 typedef struct uhdr_codec_private uhdr_codec_private_t;
 
@@ -808,6 +816,24 @@ UHDR_EXTERN uhdr_mem_block_t* uhdr_dec_get_gainmap_image(uhdr_codec_private_t* d
  * \return nullptr if probe process call is unsuccessful, gainmap metadata descriptor otherwise
  */
 UHDR_EXTERN uhdr_gainmap_metadata_t* uhdr_dec_get_gainmap_metadata(uhdr_codec_private_t* dec);
+
+/*!\brief Export the compressed gain-map image with ISO-compatible metadata.
+ *
+ * The call probes the input if needed and freezes decoder configuration, as uhdr_decode() does.
+ * A valid ISO/Adobe JPEG-R gain map is returned byte-for-byte. An Apple-only JPEG-R gain map is
+ * converted to a full-base-resolution grayscale JPEG. The compressed bytes are owned by the
+ * decoder, must be treated as read-only, and remain valid until reset or release. Width and height
+ * describe the exported gain map in source coordinates and are independent of queued or applied
+ * decoder effects. Probing freezes decoder configuration, while configured effects retain their
+ * existing decode behavior. On failure, result is unchanged. Non-JPEG inputs are unsupported.
+ *
+ * \param[in] dec decoder instance
+ * \param[out] result receives the gain-map JPEG, metadata, and exported gain-map dimensions
+ *
+ * \return #UHDR_CODEC_OK on success, an error code otherwise.
+ */
+UHDR_EXTERN uhdr_error_info_t uhdr_dec_export_gainmap(uhdr_codec_private_t* dec,
+                                                      uhdr_gainmap_export_t* result);
 
 /*!\brief Decode process call
  * After initializing the decoder context, call to this function will submit data for decoding. If

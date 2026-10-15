@@ -20,6 +20,7 @@
 #include "ultrahdr_api.h"
 #include "ultrahdr/ultrahdrcommon.h"
 #include "ultrahdr/jpegr.h"
+#include "ultrahdr/jpegencoderhelper.h"
 #include "ultrahdr/gainmapmath.h"
 #include "ultrahdr/gainmapmetadata.h"
 #include "ultrahdr/heifultrahdr.h"
@@ -543,6 +544,169 @@ CleanUp:
   return transfer;
 }
 #endif
+
+TEST_F(UltraHdrApiTest, GainmapExportPreservesGenericJpegAndMapDimensions) {
+  constexpr unsigned int map_width = 32;
+  constexpr unsigned int map_height = 24;
+  std::vector<uint8_t> map_pixels(map_width * map_height);
+  for (unsigned int y = 0; y < map_height; ++y) {
+    for (unsigned int x = 0; x < map_width; ++x) {
+      map_pixels[y * map_width + x] = static_cast<uint8_t>((x * 7 + y * 11) & 0xff);
+    }
+  }
+  uhdr_raw_image_t map_image{};
+  map_image.fmt = UHDR_IMG_FMT_8bppYCbCr400;
+  map_image.cg = UHDR_CG_UNSPECIFIED;
+  map_image.ct = UHDR_CT_SRGB;
+  map_image.range = UHDR_CR_FULL_RANGE;
+  map_image.w = map_width;
+  map_image.h = map_height;
+  map_image.planes[UHDR_PLANE_Y] = map_pixels.data();
+  map_image.stride[UHDR_PLANE_Y] = map_width;
+
+  JpegEncoderHelper map_encoder;
+  ASSERT_EQ(map_encoder.compressImage(&map_image, 100, nullptr, 0).error_code, UHDR_CODEC_OK);
+  uhdr_compressed_image_t map_jpeg = map_encoder.getCompressedImage();
+
+  uhdr_gainmap_metadata_ext_t metadata("1.0");
+  std::fill_n(metadata.min_content_boost, 3, 1.0f);
+  std::fill_n(metadata.max_content_boost, 3, 4.0f);
+  std::fill_n(metadata.gamma, 3, 1.0f);
+  std::fill_n(metadata.offset_sdr, 3, 0.0f);
+  std::fill_n(metadata.offset_hdr, 3, 0.0f);
+  metadata.hdr_capacity_min = 1.0f;
+  metadata.hdr_capacity_max = 4.0f;
+  metadata.use_base_cg = true;
+
+  uhdr_compressed_image_ext_t jpegr(UHDR_CG_BT_709, UHDR_CT_UNSPECIFIED,
+                                    UHDR_CR_UNSPECIFIED,
+                                    mSdrCompressed.data_sz + map_jpeg.data_sz + 1024 * 1024);
+  JpegR composer;
+  ASSERT_EQ(composer.encodeJPEGR(&mSdrCompressed, &map_jpeg, &metadata, &jpegr).error_code,
+            UHDR_CODEC_OK);
+  jpeg_info_struct base_info;
+  jpeg_info_struct gainmap_info;
+  jpegr_info_struct container_info;
+  container_info.primaryImgInfo = &base_info;
+  container_info.gainmapImgInfo = &gainmap_info;
+  ASSERT_EQ(composer.getJPEGRInfo(&jpegr, &container_info).error_code, UHDR_CODEC_OK);
+
+  std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> decoder(
+      uhdr_create_decoder(), uhdr_release_decoder);
+  ASSERT_NE(decoder, nullptr);
+  ASSERT_EQ(uhdr_dec_set_image(decoder.get(), &jpegr).error_code, UHDR_CODEC_OK);
+
+  uhdr_gainmap_export_t exported{};
+  ASSERT_EQ(uhdr_dec_export_gainmap(decoder.get(), &exported).error_code, UHDR_CODEC_OK);
+  ASSERT_NE(exported.image.data, nullptr);
+  EXPECT_EQ(exported.width, map_width);
+  EXPECT_EQ(exported.height, map_height);
+  ASSERT_EQ(exported.image.data_sz, gainmap_info.imgData.size());
+  EXPECT_EQ(std::memcmp(exported.image.data, gainmap_info.imgData.data(),
+                        gainmap_info.imgData.size()),
+            0);
+
+  EXPECT_EQ(uhdr_dec_set_out_color_transfer(decoder.get(), UHDR_CT_LINEAR).error_code,
+            UHDR_CODEC_INVALID_OPERATION);
+  ASSERT_EQ(uhdr_decode(decoder.get()).error_code, UHDR_CODEC_OK);
+  uhdr_gainmap_export_t repeated{};
+  ASSERT_EQ(uhdr_dec_export_gainmap(decoder.get(), &repeated).error_code, UHDR_CODEC_OK);
+  EXPECT_EQ(repeated.image.data, exported.image.data);
+  EXPECT_EQ(repeated.image.data_sz, exported.image.data_sz);
+  EXPECT_EQ(repeated.width, map_width);
+  EXPECT_EQ(repeated.height, map_height);
+
+  uhdr_reset_decoder(decoder.get());
+  ASSERT_EQ(uhdr_dec_set_image(decoder.get(), &jpegr).error_code, UHDR_CODEC_OK);
+  uhdr_gainmap_export_t after_reset{};
+  ASSERT_EQ(uhdr_dec_export_gainmap(decoder.get(), &after_reset).error_code, UHDR_CODEC_OK);
+  EXPECT_EQ(after_reset.width, map_width);
+  EXPECT_EQ(after_reset.height, map_height);
+  ASSERT_EQ(after_reset.image.data_sz, gainmap_info.imgData.size());
+  EXPECT_EQ(std::memcmp(after_reset.image.data, gainmap_info.imgData.data(),
+                        gainmap_info.imgData.size()),
+            0);
+
+  std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> invalid_decoder(
+      uhdr_create_decoder(), uhdr_release_decoder);
+  ASSERT_NE(invalid_decoder, nullptr);
+  ASSERT_EQ(uhdr_dec_set_image(invalid_decoder.get(), &jpegr).error_code, UHDR_CODEC_OK);
+  ASSERT_EQ(uhdr_dec_probe(invalid_decoder.get()).error_code, UHDR_CODEC_OK);
+  auto* decoder_handle = dynamic_cast<uhdr_decoder_private*>(invalid_decoder.get());
+  ASSERT_NE(decoder_handle, nullptr);
+  // Emulate metadata fields that parse successfully but fail API4's semantic descriptor contract.
+  decoder_handle->m_metadata.gamma[0] = 0.0f;
+  uint8_t sentinel = 0x5a;
+  uhdr_gainmap_export_t invalid_result{};
+  invalid_result.image.data = &sentinel;
+  invalid_result.image.data_sz = 1;
+  invalid_result.image.capacity = 1;
+  invalid_result.width = 17;
+  invalid_result.height = 19;
+  EXPECT_EQ(uhdr_dec_export_gainmap(invalid_decoder.get(), &invalid_result).error_code,
+            UHDR_CODEC_INVALID_PARAM);
+  EXPECT_EQ(invalid_result.image.data, &sentinel);
+  EXPECT_EQ(invalid_result.image.data_sz, 1u);
+  EXPECT_EQ(invalid_result.width, 17u);
+  EXPECT_EQ(invalid_result.height, 19u);
+}
+
+TEST_F(UltraHdrApiTest, GainmapExportFailureLeavesResultUntouched) {
+  std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> decoder(
+      uhdr_create_decoder(), uhdr_release_decoder);
+  ASSERT_NE(decoder, nullptr);
+  ASSERT_EQ(uhdr_dec_set_image(decoder.get(), &mSdrCompressed).error_code, UHDR_CODEC_OK);
+
+  uint8_t sentinel = 0x5a;
+  uhdr_gainmap_export_t result{};
+  result.image.data = &sentinel;
+  result.image.data_sz = 1;
+  result.image.capacity = 1;
+  result.width = 17;
+  result.height = 19;
+  EXPECT_NE(uhdr_dec_export_gainmap(decoder.get(), &result).error_code, UHDR_CODEC_OK);
+  EXPECT_EQ(result.image.data, &sentinel);
+  EXPECT_EQ(result.image.data_sz, 1u);
+  EXPECT_EQ(result.width, 17u);
+  EXPECT_EQ(result.height, 19u);
+}
+
+TEST_F(UltraHdrApiTest, AppleGainmapExportProducesFullResolutionGrayJpeg) {
+  std::vector<uint8_t> apple_data;
+  ASSERT_TRUE(loadFile("apple_gainmap_new.jpg", apple_data));
+  uhdr_compressed_image_t apple_image{};
+  apple_image.data = apple_data.data();
+  apple_image.data_sz = apple_data.size();
+  apple_image.capacity = apple_data.size();
+  apple_image.cg = UHDR_CG_UNSPECIFIED;
+  apple_image.ct = UHDR_CT_UNSPECIFIED;
+  apple_image.range = UHDR_CR_UNSPECIFIED;
+
+  std::unique_ptr<uhdr_codec_private_t, decltype(&uhdr_release_decoder)> decoder(
+      uhdr_create_decoder(), uhdr_release_decoder);
+  ASSERT_NE(decoder, nullptr);
+  ASSERT_EQ(uhdr_dec_set_image(decoder.get(), &apple_image).error_code, UHDR_CODEC_OK);
+  uhdr_gainmap_export_t exported{};
+  ASSERT_EQ(uhdr_dec_export_gainmap(decoder.get(), &exported).error_code, UHDR_CODEC_OK);
+
+  EXPECT_EQ(exported.width, static_cast<unsigned int>(uhdr_dec_get_image_width(decoder.get())));
+  EXPECT_EQ(exported.height, static_cast<unsigned int>(uhdr_dec_get_image_height(decoder.get())));
+  EXPECT_EQ(exported.width, 384u);
+  EXPECT_EQ(exported.height, 512u);
+  EXPECT_FLOAT_EQ(exported.metadata.hdr_capacity_max, 8.0f);
+  EXPECT_FLOAT_EQ(exported.metadata.min_content_boost[0], 1.0f);
+  EXPECT_FLOAT_EQ(exported.metadata.gamma[0], 1.0f);
+  EXPECT_EQ(exported.metadata.use_base_cg, 1);
+
+  JpegDecoderHelper exported_map_decoder;
+  ASSERT_EQ(exported_map_decoder.parseImage(exported.image.data, exported.image.data_sz)
+                .error_code,
+            UHDR_CODEC_OK);
+  EXPECT_EQ(exported_map_decoder.getDecompressedImageWidth(), exported.width);
+  EXPECT_EQ(exported_map_decoder.getDecompressedImageHeight(), exported.height);
+  EXPECT_EQ(exported_map_decoder.getNumComponentsInImage(), 1u);
+  EXPECT_EQ(exported_map_decoder.getDataPrecision(), 8u);
+}
 
 TEST_F(UltraHdrApiTest, RoutingProbeRejectsInvalidInputAndOrdinaryJpeg) {
   EXPECT_EQ(uhdr_is_supported_gainmap_image(nullptr, 1), 0);

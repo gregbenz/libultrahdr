@@ -229,6 +229,7 @@ uhdr_error_info_t JpegDecoderHelper::decompressImage(const void* image, size_t l
   mIsoMetadataBuffer.clear();
   mOutFormat = UHDR_IMG_FMT_UNSPECIFIED;
   mNumComponents = 1;
+  mDataPrecision = 0;
   mChromaHorizontalSubsampling = 1;
   mChromaVerticalSubsampling = 1;
   for (int i = 0; i < kMaxNumComponents; i++) {
@@ -327,6 +328,7 @@ uhdr_error_info_t JpegDecoderHelper::decode(const void* image, size_t length, de
       jpeg_destroy_decompress(&cinfo);
       return status;
     }
+    mDataPrecision = cinfo.data_precision;
 
     for (int i = 0, product = 0; i < cinfo.num_components; i++) {
       if (cinfo.comp_info[i].h_samp_factor < 1 || cinfo.comp_info[i].h_samp_factor > 4) {

@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -46,6 +47,61 @@ uhdr_error_info_t applyGainMapGLES(uhdr_raw_image_t* sdr_intent, uhdr_raw_image_
                                    uhdr_color_gamut_t sdr_cg, uhdr_color_gamut_t hdr_cg,
                                    uhdr_opengl_ctxt_t* opengl_ctxt);
 #endif
+
+namespace {
+
+constexpr size_t kAppleMapPowerTableSize = 1024;
+constexpr float kAppleMapPowerTableError = 3.2e-7f;
+
+class AppleMapPowerTable {
+ public:
+  explicit AppleMapPowerTable(float headroom) {
+    const double boost_error = std::log2(1.0 + (headroom - 1.0) * kAppleMapPowerTableError);
+    m_use_table = std::isfinite(boost_error) && boost_error <= 1.0e-5;
+    if (m_use_table) {
+      for (size_t i = 0; i < m_values.size(); ++i) {
+        const float value = static_cast<float>(i) / static_cast<float>(m_values.size() - 1);
+        m_values[i] = std::pow(value, 2.2f);
+      }
+    }
+  }
+
+  float evaluate(float value) const {
+    value = CLIP3(value, 0.0f, 1.0f);
+    if (!m_use_table) return std::pow(value, 2.2f);
+    const float position = value * static_cast<float>(m_values.size() - 1);
+    const size_t lower = static_cast<size_t>(position);
+    if (lower >= m_values.size() - 1) return m_values.back();
+    const float fraction = position - static_cast<float>(lower);
+    return m_values[lower] + fraction * (m_values[lower + 1] - m_values[lower]);
+  }
+
+ private:
+  std::array<float, kAppleMapPowerTableSize> m_values{};
+  bool m_use_table = false;
+};
+
+float sampleAppleMap(const uhdr_raw_image_t* map, unsigned int x, unsigned int y,
+                    unsigned int output_width, unsigned int output_height) {
+  const auto* pixels = static_cast<const uint8_t*>(map->planes[UHDR_PLANE_Y]);
+  double source_x = (static_cast<double>(x) + 0.5) * map->w / output_width - 0.5;
+  double source_y = (static_cast<double>(y) + 0.5) * map->h / output_height - 0.5;
+  source_x = std::max(0.0, std::min(source_x, static_cast<double>(map->w - 1)));
+  source_y = std::max(0.0, std::min(source_y, static_cast<double>(map->h - 1)));
+  const unsigned int x0 = static_cast<unsigned int>(source_x);
+  const unsigned int y0 = static_cast<unsigned int>(source_y);
+  const unsigned int x1 = std::min(x0 + 1, map->w - 1);
+  const unsigned int y1 = std::min(y0 + 1, map->h - 1);
+  const double fx = source_x - x0;
+  const double fy = source_y - y0;
+  const double top = pixels[y0 * map->stride[UHDR_PLANE_Y] + x0] * (1.0 - fx) +
+                     pixels[y0 * map->stride[UHDR_PLANE_Y] + x1] * fx;
+  const double bottom = pixels[y1 * map->stride[UHDR_PLANE_Y] + x0] * (1.0 - fx) +
+                        pixels[y1 * map->stride[UHDR_PLANE_Y] + x1] * fx;
+  return static_cast<float>((top * (1.0 - fy) + bottom * fy) / 255.0);
+}
+
+}  // namespace
 
 // Gain map metadata
 #ifdef UHDR_WRITE_XMP
@@ -1467,6 +1523,10 @@ uhdr_error_info_t JpegR::getJPEGRInfo(uhdr_compressed_image_t* uhdr_compressed_i
 uhdr_error_info_t UltraHdr::parseGainMapMetadata(uint8_t* iso_data, size_t iso_size, uint8_t* xmp_data,
                                                  size_t xmp_size, uint8_t* exif_data, int exif_size,
                                                  uhdr_gainmap_metadata_ext_t* uhdr_metadata) {
+  if (uhdr_metadata != nullptr) {
+    uhdr_metadata->is_apple_gainmap = false;
+    uhdr_metadata->apple_gainmap_version = 0;
+  }
   if (iso_size > 0) {
     if (iso_size < kIsoNameSpace.size() + 1) {
       uhdr_error_info_t status;
@@ -1549,6 +1609,16 @@ uhdr_error_info_t JpegR::decodeJPEGR(uhdr_compressed_image_t* uhdr_compressed_im
       gainmap_metadata->hdr_capacity_max = uhdr_metadata.hdr_capacity_max;
       gainmap_metadata->use_base_cg = uhdr_metadata.use_base_cg;
     }
+    if (uhdr_metadata.is_apple_gainmap &&
+        (jpeg_dec_obj_gm.getNumComponentsInImage() != 1 ||
+         jpeg_dec_obj_gm.getDataPrecision() != 8)) {
+      uhdr_error_info_t status;
+      status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+      status.has_detail = 1;
+      snprintf(status.detail, sizeof status.detail,
+               "Apple gain map must be an 8-bit monochrome JPEG");
+      return status;
+    }
   }
 
   uhdr_raw_image_t sdr_intent = jpeg_dec_obj_sdr.getDecompressedImage();
@@ -1564,6 +1634,129 @@ uhdr_error_info_t JpegR::decodeJPEGR(uhdr_compressed_image_t* uhdr_compressed_im
                               jpeg_dec_obj_sdr.getChromaHorizontalSubsamplingFactor(),
                               jpeg_dec_obj_sdr.getChromaVerticalSubsamplingFactor()));
 
+  return g_no_error;
+}
+
+uhdr_error_info_t JpegR::exportAppleGainMap(
+    uhdr_compressed_image_t* input, const uhdr_gainmap_metadata_ext_t* input_metadata,
+    std::unique_ptr<uhdr_compressed_image_ext_t>* output,
+    uhdr_gainmap_metadata_ext_t* output_metadata, unsigned int* width, unsigned int* height) {
+  if (input == nullptr || input_metadata == nullptr || output == nullptr ||
+      output_metadata == nullptr || width == nullptr || height == nullptr ||
+      !input_metadata->is_apple_gainmap) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_INVALID_PARAM;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail, "invalid Apple gain-map export arguments");
+    return status;
+  }
+  const float headroom = input_metadata->hdr_capacity_max;
+  if (!std::isfinite(headroom) || headroom < 1.0f) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_ERROR;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail, "invalid Apple gain-map headroom for export");
+    return status;
+  }
+
+  uhdr_compressed_image_t base_jpeg{};
+  uhdr_compressed_image_t source_map_jpeg{};
+  UHDR_ERR_CHECK(extractPrimaryImageAndGainMap(input, &base_jpeg, &source_map_jpeg));
+
+  JpegDecoderHelper base_decoder;
+  UHDR_ERR_CHECK(base_decoder.parseImage(base_jpeg.data, base_jpeg.data_sz));
+  const unsigned int base_width = base_decoder.getDecompressedImageWidth();
+  const unsigned int base_height = base_decoder.getDecompressedImageHeight();
+  if (base_width == 0 || base_height == 0 ||
+      static_cast<size_t>(base_width) > std::numeric_limits<size_t>::max() / base_height) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_MEM_ERROR;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail, "Apple gain-map export dimensions overflow");
+    return status;
+  }
+
+  JpegDecoderHelper map_decoder;
+  UHDR_ERR_CHECK(map_decoder.decompressImage(source_map_jpeg.data, source_map_jpeg.data_sz,
+                                             DECODE_STREAM));
+  if (map_decoder.getNumComponentsInImage() != 1 || map_decoder.getDataPrecision() != 8) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail,
+             "Apple gain map must be an 8-bit monochrome JPEG");
+    return status;
+  }
+  uhdr_raw_image_t source_map = map_decoder.getDecompressedImage();
+  if (source_map.fmt != UHDR_IMG_FMT_8bppYCbCr400 ||
+      source_map.planes[UHDR_PLANE_Y] == nullptr || source_map.stride[UHDR_PLANE_Y] < source_map.w) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail, "decoded Apple gain map has an unsupported layout");
+    return status;
+  }
+
+  const size_t pixel_count = static_cast<size_t>(base_width) * base_height;
+  std::vector<uint8_t> normalized_map(pixel_count, 0);
+  AppleMapPowerTable power(headroom);
+  const double log_headroom = headroom > 1.0f ? std::log(static_cast<double>(headroom)) : 1.0;
+  for (unsigned int y = 0; y < base_height; ++y) {
+    for (unsigned int x = 0; x < base_width; ++x) {
+      if (headroom == 1.0f) continue;
+      const double map_value = sampleAppleMap(&source_map, x, y, base_width, base_height);
+      const double linear_gain = power.evaluate(static_cast<float>(map_value));
+      const double normalized =
+          std::log1p((static_cast<double>(headroom) - 1.0) * linear_gain) / log_headroom;
+      const long encoded = std::lround(CLIP3(normalized, 0.0, 1.0) * 255.0);
+      normalized_map[static_cast<size_t>(y) * base_width + x] =
+          static_cast<uint8_t>(CLIP3(encoded, 0L, 255L));
+    }
+  }
+
+  uhdr_raw_image_t normalized_map_image{};
+  normalized_map_image.fmt = UHDR_IMG_FMT_8bppYCbCr400;
+  normalized_map_image.cg = UHDR_CG_UNSPECIFIED;
+  normalized_map_image.ct = UHDR_CT_SRGB;
+  normalized_map_image.range = UHDR_CR_FULL_RANGE;
+  normalized_map_image.w = base_width;
+  normalized_map_image.h = base_height;
+  normalized_map_image.planes[UHDR_PLANE_Y] = normalized_map.data();
+  normalized_map_image.stride[UHDR_PLANE_Y] = base_width;
+
+  JpegEncoderHelper map_encoder;
+  UHDR_ERR_CHECK(map_encoder.compressImage(&normalized_map_image, 100, nullptr, 0));
+  uhdr_compressed_image_t normalized_map_jpeg = map_encoder.getCompressedImage();
+
+  uhdr_gainmap_metadata_ext_t normalized_metadata(kJpegrVersion);
+  for (int channel = 0; channel < 3; ++channel) {
+    normalized_metadata.min_content_boost[channel] = 1.0f;
+    normalized_metadata.max_content_boost[channel] = headroom;
+    normalized_metadata.gamma[channel] = 1.0f;
+    normalized_metadata.offset_sdr[channel] = 0.0f;
+    normalized_metadata.offset_hdr[channel] = 0.0f;
+  }
+  normalized_metadata.hdr_capacity_min = 1.0f;
+  normalized_metadata.hdr_capacity_max = headroom > 1.0f ? headroom : 2.0f;
+  normalized_metadata.use_base_cg = true;
+
+  if (normalized_map_jpeg.data == nullptr || normalized_map_jpeg.data_sz == 0) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_ERROR;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail, "Apple gain-map JPEG encoding returned no data");
+    return status;
+  }
+  auto exported = std::make_unique<uhdr_compressed_image_ext_t>(
+      UHDR_CG_UNSPECIFIED, UHDR_CT_UNSPECIFIED, UHDR_CR_UNSPECIFIED,
+      normalized_map_jpeg.data_sz);
+  memcpy(exported->data, normalized_map_jpeg.data, normalized_map_jpeg.data_sz);
+  exported->data_sz = normalized_map_jpeg.data_sz;
+
+  *width = base_width;
+  *height = base_height;
+  *output_metadata = normalized_metadata;
+  *output = std::move(exported);
   return g_no_error;
 }
 
@@ -1629,7 +1822,31 @@ uhdr_error_info_t UltraHdr::applyGainMap(
              gainmap_metadata->version.c_str());
     return status;
   }
-  UHDR_ERR_CHECK(uhdr_validate_gainmap_metadata_descriptor(gainmap_metadata));
+  if (gainmap_metadata->is_apple_gainmap) {
+    const float headroom = gainmap_metadata->hdr_capacity_max;
+    bool valid_apple_metadata = gainmap_metadata->apple_gainmap_version == 65536 ||
+                                gainmap_metadata->apple_gainmap_version == 131072;
+    valid_apple_metadata = valid_apple_metadata && std::isfinite(headroom) && headroom >= 1.0f &&
+                           gainmap_metadata->hdr_capacity_min == 1.0f &&
+                           gainmap_metadata->use_base_cg;
+    for (int channel = 0; channel < 3; ++channel) {
+      valid_apple_metadata = valid_apple_metadata &&
+                             gainmap_metadata->min_content_boost[channel] == 1.0f &&
+                             gainmap_metadata->max_content_boost[channel] == headroom &&
+                             gainmap_metadata->gamma[channel] == 1.0f &&
+                             gainmap_metadata->offset_sdr[channel] == 0.0f &&
+                             gainmap_metadata->offset_hdr[channel] == 0.0f;
+    }
+    if (!valid_apple_metadata) {
+      uhdr_error_info_t status;
+      status.error_code = UHDR_CODEC_ERROR;
+      status.has_detail = 1;
+      snprintf(status.detail, sizeof status.detail, "invalid Apple gain-map metadata");
+      return status;
+    }
+  } else {
+    UHDR_ERR_CHECK(uhdr_validate_gainmap_metadata_descriptor(gainmap_metadata));
+  }
   if (sdr_intent->fmt != UHDR_IMG_FMT_24bppYCbCr444 &&
       sdr_intent->fmt != UHDR_IMG_FMT_16bppYCbCr422 &&
       sdr_intent->fmt != UHDR_IMG_FMT_12bppYCbCr420 &&
@@ -1696,7 +1913,7 @@ uhdr_error_info_t UltraHdr::applyGainMap(
 #endif
 
   std::unique_ptr<uhdr_raw_image_ext_t> resized_gainmap = nullptr;
-  {
+  if (!gainmap_metadata->is_apple_gainmap) {
     float primary_aspect_ratio = (float)sdr_intent->w / sdr_intent->h;
     float gainmap_aspect_ratio = (float)gainmap_img->w / gainmap_img->h;
     float delta_aspect_ratio = fabs(primary_aspect_ratio - gainmap_aspect_ratio);
@@ -1721,11 +1938,13 @@ uhdr_error_info_t UltraHdr::applyGainMap(
   int map_scale_factor_rnd = (std::max)(1, (int)std::roundf(map_scale_factor));
 
   // Table will only be used when map scale factor is integer.
-  ShepardsIDW idwTable(map_scale_factor_rnd);
+  ShepardsIDW idwTable(gainmap_metadata->is_apple_gainmap ? 1 : map_scale_factor_rnd);
   float display_boost = (std::min)(max_display_boost, gainmap_metadata->hdr_capacity_max);
 
   float gainmap_weight;
-  if (display_boost != gainmap_metadata->hdr_capacity_max) {
+  if (gainmap_metadata->is_apple_gainmap) {
+    gainmap_weight = 1.0f;
+  } else if (display_boost != gainmap_metadata->hdr_capacity_max) {
     gainmap_weight =
         (log2(display_boost) - log2(gainmap_metadata->hdr_capacity_min)) /
         (log2(gainmap_metadata->hdr_capacity_max) - log2(gainmap_metadata->hdr_capacity_min));
@@ -1735,6 +1954,21 @@ uhdr_error_info_t UltraHdr::applyGainMap(
     gainmap_weight = 1.0f;
   }
   GainLUT gainLUT(gainmap_metadata, gainmap_weight);
+  std::unique_ptr<AppleMapPowerTable> appleMapPower;
+  if (gainmap_metadata->is_apple_gainmap) {
+    appleMapPower = std::make_unique<AppleMapPowerTable>(gainmap_metadata->hdr_capacity_max);
+  }
+  if (gainmap_metadata->is_apple_gainmap &&
+      (gainmap_img->fmt != UHDR_IMG_FMT_8bppYCbCr400 ||
+       gainmap_img->planes[UHDR_PLANE_Y] == nullptr || gainmap_img->w == 0 || gainmap_img->h == 0 ||
+       gainmap_img->stride[UHDR_PLANE_Y] < gainmap_img->w)) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail,
+             "Apple gain map must decode as an 8-bit monochrome JPEG");
+    return status;
+  }
 
   GetPixelFn get_pixel_fn = getPixelFn(sdr_intent->fmt);
   if (get_pixel_fn == nullptr) {
@@ -1754,7 +1988,9 @@ uhdr_error_info_t UltraHdr::applyGainMap(
        gainmap_weight,
 #endif
        map_scale_factor, get_pixel_fn, use_jpeg_centered_base_sampling,
-       jpeg_chroma_horizontal_subsampling, jpeg_chroma_vertical_subsampling]() -> void {
+       jpeg_chroma_horizontal_subsampling, jpeg_chroma_vertical_subsampling,
+       apple = gainmap_metadata->is_apple_gainmap, display_boost,
+       &appleMapPower]() -> void {
     unsigned int width = sdr_intent->w;
     unsigned int rowStart, rowEnd;
     const bool isSdrIntentRgb = isPixelFormatRgb(sdr_intent->fmt);
@@ -1787,7 +2023,13 @@ uhdr_error_info_t UltraHdr::applyGainMap(
 #endif
           rgb_sdr = sdrGamutConversionFn(rgb_sdr);
           Color rgb_hdr;
-          if (gainmap_img->fmt == UHDR_IMG_FMT_8bppYCbCr400) {
+          if (apple) {
+            const float map_value = sampleAppleMap(gainmap_img, x, y, sdr_intent->w,
+                                                   sdr_intent->h);
+            const float gain =
+                1.0f + (display_boost - 1.0f) * appleMapPower->evaluate(map_value);
+            rgb_hdr = rgb_sdr * gain;
+          } else if (gainmap_img->fmt == UHDR_IMG_FMT_8bppYCbCr400) {
             float gain;
 
             if (map_scale_factor != floorf(map_scale_factor)) {
@@ -2107,6 +2349,7 @@ uhdr_error_info_t JpegR::parseJpegInfo(uhdr_compressed_image_t* jpeg_image, j_in
     image_info->width = imgWidth;
     image_info->height = imgHeight;
     image_info->numComponents = numComponents;
+    image_info->bitDepth = jpeg_dec_obj.getDataPrecision();
     if (copy_image_data) {
       image_info->imgData.resize(jpeg_image->data_sz, 0);
       memcpy(static_cast<void*>(image_info->imgData.data()), jpeg_image->data, jpeg_image->data_sz);

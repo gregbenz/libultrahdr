@@ -101,6 +101,9 @@ class JpegDecoderHelper {
   /*!\brief returns number of components in image */
   unsigned int getNumComponentsInImage() { return mNumComponents; }
 
+  /*!\brief returns JPEG sample precision */
+  unsigned int getDataPrecision() { return mDataPrecision; }
+
   /*!\brief returns JPEG chroma factors relative to luma after YCbCr decompression */
   unsigned int getChromaHorizontalSubsamplingFactor() { return mChromaHorizontalSubsampling; }
   unsigned int getChromaVerticalSubsamplingFactor() { return mChromaVerticalSubsampling; }
@@ -156,6 +159,7 @@ class JpegDecoderHelper {
   // image attributes
   uhdr_img_fmt_t mOutFormat;
   unsigned int mNumComponents;
+  unsigned int mDataPrecision = 0;
   unsigned int mPlaneWidth[kMaxNumComponents];
   unsigned int mPlaneHeight[kMaxNumComponents];
   unsigned int mPlaneHStride[kMaxNumComponents];

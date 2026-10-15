@@ -26,6 +26,7 @@
 #include "ultrahdr/ultrahdrcommon.h"
 #include "ultrahdr/jpegr.h"
 #include "ultrahdr/jpegrutils.h"
+#include "ultrahdr/gainmapmetadata.h"
 
 //#define DUMP_OUTPUT
 
@@ -1729,6 +1730,34 @@ static std::vector<uint8_t> appleXmpWithoutHeadroom() {
   return xmpData;
 }
 
+static std::vector<uint8_t> appleXmp(const std::string& version, const std::string& headroom,
+                                     const std::string& nativeFormat = "",
+                                     const std::string& storedFormat = "") {
+  const std::string nameSpace = "http://ns.adobe.com/xap/1.0/\0";
+  const size_t nameSpaceLength = nameSpace.size() + 1;
+  std::string xmp =
+      "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF "
+      "xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description "
+      "xmlns:HDRGainMap=\"http://ns.apple.com/HDRGainMap/1.0/\" "
+      "xmlns:apdi=\"http://apple.com/appledigitalcamera/1.0/\">"
+      "<HDRGainMap:HDRGainMapVersion>" + version + "</HDRGainMap:HDRGainMapVersion>";
+  if (!headroom.empty()) {
+    xmp += "<HDRGainMap:HDRGainMapHeadroom>" + headroom + "</HDRGainMap:HDRGainMapHeadroom>";
+  }
+  if (!nativeFormat.empty()) {
+    xmp += "<apdi:NativeFormat>" + nativeFormat + "</apdi:NativeFormat>";
+  }
+  if (!storedFormat.empty()) {
+    xmp += "<apdi:StoredFormat>" + storedFormat + "</apdi:StoredFormat>";
+  }
+  xmp += "</rdf:Description></rdf:RDF></x:xmpmeta>";
+  std::vector<uint8_t> data;
+  data.insert(data.end(), reinterpret_cast<const uint8_t*>(nameSpace.c_str()),
+              reinterpret_cast<const uint8_t*>(nameSpace.c_str()) + nameSpaceLength);
+  data.insert(data.end(), xmp.begin(), xmp.end());
+  return data;
+}
+
 static void putU16(std::vector<uint8_t>& v, size_t pos, uint16_t x, bool bigEndian) {
   v[pos + (bigEndian ? 0 : 1)] = x >> 8;
   v[pos + (bigEndian ? 1 : 0)] = x & 0xff;
@@ -1854,6 +1883,132 @@ TEST(JpegRTest, readAppleHeadroomXmpAsLinearBoost) {
   EXPECT_FLOAT_EQ(metadata.hdr_capacity_max, 4.0f);
 }
 
+TEST(JpegRTest, appleXmpValidatesVersionFormatAndHeadroom) {
+  uhdr_gainmap_metadata_ext_t metadata;
+  std::vector<uint8_t> good = appleXmp("131072", "4.532783", "1278226488", "1278226488");
+  ASSERT_EQ(getMetadataFromXMP(good.data(), good.size(), nullptr, 0, &metadata).error_code,
+            UHDR_CODEC_OK);
+  EXPECT_TRUE(metadata.is_apple_gainmap);
+  EXPECT_EQ(metadata.apple_gainmap_version, 131072u);
+  EXPECT_FLOAT_EQ(metadata.hdr_capacity_max, 4.532783f);
+
+  for (const auto& bad : {appleXmp("196608", "4"), appleXmp("131072junk", "4"),
+                          appleXmp("131072", "4", "1")}) {
+    EXPECT_EQ(getMetadataFromXMP(const_cast<uint8_t*>(bad.data()), bad.size(), nullptr, 0,
+                                 &metadata)
+                  .error_code,
+              UHDR_CODEC_UNSUPPORTED_FEATURE);
+  }
+  for (const auto& bad : {appleXmp("131072", "0.99"), appleXmp("131072", "NaN"),
+                          appleXmp("131072", "4junk")}) {
+    EXPECT_EQ(getMetadataFromXMP(const_cast<uint8_t*>(bad.data()), bad.size(), nullptr, 0,
+                                 &metadata)
+                  .error_code,
+              UHDR_CODEC_ERROR);
+  }
+}
+
+TEST(JpegRTest, appleVersionIsIndependentFromAdobeVersion) {
+  auto withEarlierAdobeAttribute = appleXmp("131072", "3.5");
+  std::string xml(reinterpret_cast<const char*>(withEarlierAdobeAttribute.data()),
+                  withEarlierAdobeAttribute.size());
+  const std::string description = "<rdf:Description";
+  const size_t description_start = xml.find(description);
+  ASSERT_NE(description_start, std::string::npos);
+  const size_t attributes_end = xml.find('>', description_start);
+  ASSERT_NE(attributes_end, std::string::npos);
+  xml.insert(attributes_end,
+             " xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\" hdrgm:Version=\"1.0\"");
+  withEarlierAdobeAttribute.assign(xml.begin(), xml.end());
+
+  uhdr_gainmap_metadata_ext_t metadata;
+  ASSERT_EQ(getMetadataFromXMP(withEarlierAdobeAttribute.data(), withEarlierAdobeAttribute.size(),
+                               nullptr, 0, &metadata)
+                .error_code,
+            UHDR_CODEC_OK);
+  EXPECT_EQ(metadata.apple_gainmap_version, 131072u);
+
+  // A later nested description can also report an Adobe version after the Apple element.
+  auto withLaterAdobeAttribute = appleXmp("131072", "3.5");
+  std::string later_xml(reinterpret_cast<const char*>(withLaterAdobeAttribute.data()),
+                        withLaterAdobeAttribute.size());
+  const std::string close_description = "</rdf:Description>";
+  const size_t close_at = later_xml.find(close_description);
+  ASSERT_NE(close_at, std::string::npos);
+  later_xml.insert(close_at,
+                   "<rdf:Description xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\" "
+                   "hdrgm:Version=\"1.0\"/>");
+  withLaterAdobeAttribute.assign(later_xml.begin(), later_xml.end());
+  ASSERT_EQ(getMetadataFromXMP(withLaterAdobeAttribute.data(), withLaterAdobeAttribute.size(),
+                               nullptr, 0, &metadata)
+                .error_code,
+            UHDR_CODEC_OK);
+  EXPECT_EQ(metadata.apple_gainmap_version, 131072u);
+}
+
+TEST(JpegRTest, parseGainMapMetadataClearsAppleStateOnIsoReuse) {
+  JpegR parser;
+  uhdr_gainmap_metadata_ext_t metadata;
+  std::vector<uint8_t> apple_xmp = appleXmp("131072", "3.5");
+  ASSERT_EQ(parser.parseGainMapMetadata(nullptr, 0, apple_xmp.data(), apple_xmp.size(), nullptr, 0,
+                                        &metadata)
+                .error_code,
+            UHDR_CODEC_OK);
+  ASSERT_TRUE(metadata.is_apple_gainmap);
+  ASSERT_EQ(metadata.apple_gainmap_version, 131072u);
+
+  uhdr_gainmap_metadata_frac fraction;
+  fraction.alternateHdrHeadroomN = 2;
+  std::vector<uint8_t> encoded_metadata;
+  ASSERT_EQ(uhdr_gainmap_metadata_frac::encodeGainmapMetadata(&fraction, encoded_metadata)
+                .error_code,
+            UHDR_CODEC_OK);
+  const std::string iso_namespace = "urn:iso:std:iso:ts:21496:-1\0";
+  std::vector<uint8_t> iso_data(iso_namespace.begin(), iso_namespace.end());
+  iso_data.push_back(0);
+  iso_data.insert(iso_data.end(), encoded_metadata.begin(), encoded_metadata.end());
+  ASSERT_EQ(parser.parseGainMapMetadata(iso_data.data(), iso_data.size(), nullptr, 0, nullptr, 0,
+                                        &metadata)
+                .error_code,
+            UHDR_CODEC_OK);
+  EXPECT_FALSE(metadata.is_apple_gainmap);
+  EXPECT_EQ(metadata.apple_gainmap_version, 0u);
+}
+
+TEST(JpegRTest, appleHeadroomFallbackAndExifPriority) {
+  uhdr_gainmap_metadata_ext_t metadata;
+  std::vector<uint8_t> validXmp = appleXmp("65536", "3.5");
+  AppleExifOffsets invalidOffsets;
+  invalidOffsets.tag33 = 0xffffffffu;
+  std::vector<uint8_t> invalidExif = appleExif(invalidOffsets);
+  ASSERT_EQ(getMetadataFromXMP(validXmp.data(), validXmp.size(), invalidExif.data(),
+                               invalidExif.size(), &metadata)
+                .error_code,
+            UHDR_CODEC_OK);
+  EXPECT_FLOAT_EQ(metadata.hdr_capacity_max, 3.5f);
+
+  std::vector<uint8_t> conflictingXmp = appleXmp("65536", "not-a-number");
+  std::vector<uint8_t> validExif = appleExif(AppleExifOffsets());
+  ASSERT_EQ(getMetadataFromXMP(conflictingXmp.data(), conflictingXmp.size(), validExif.data(),
+                               validExif.size(), &metadata)
+                .error_code,
+            UHDR_CODEC_OK);
+  EXPECT_FLOAT_EQ(metadata.hdr_capacity_max, static_cast<float>(pow(2.0, 1.7)));
+
+  std::vector<uint8_t> duplicateHeadroom = appleXmp("65536", "3.5");
+  const std::string duplicate = "<HDRGainMap:HDRGainMapHeadroom>4</HDRGainMap:HDRGainMapHeadroom>";
+  const std::string closingDescription = "</rdf:Description>";
+  const std::string payload(reinterpret_cast<const char*>(duplicateHeadroom.data()),
+                            duplicateHeadroom.size());
+  const size_t insertion = payload.find(closingDescription);
+  ASSERT_NE(insertion, std::string::npos);
+  duplicateHeadroom.insert(duplicateHeadroom.begin() + insertion, duplicate.begin(), duplicate.end());
+  EXPECT_EQ(getMetadataFromXMP(duplicateHeadroom.data(), duplicateHeadroom.size(), nullptr, 0,
+                               &metadata)
+                .error_code,
+            UHDR_CODEC_ERROR);
+}
+
 TEST(JpegRTest, decodeApple) {
   JpegR decoder;
   uhdr_compressed_image_t uhdrCompressedImg;
@@ -1886,7 +2041,8 @@ TEST(JpegRTest, decodeApple) {
     const uhdr_gainmap_metadata_t* gainmapMetadata = uhdr_dec_get_gainmap_metadata(dec);
     ASSERT_NE(gainmapMetadata, nullptr);
 
-    const double headroom = fileName == kOldAppleFileName ? 8.0 : 4.532783;
+    // A complete Apple Maker Notes pair takes precedence over the conflicting XMP value.
+    const double headroom = 8.0;
     for (int c = 0; c < 3; ++c) {
       EXPECT_EQ(gainmapMetadata->gamma[c], 1.0f);
       EXPECT_EQ(gainmapMetadata->offset_sdr[c], 0.0f);

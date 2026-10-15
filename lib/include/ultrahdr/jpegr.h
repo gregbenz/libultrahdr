@@ -34,6 +34,7 @@ struct jpeg_info_struct {
   unsigned int width;
   unsigned int height;
   unsigned int numComponents;
+  unsigned int bitDepth;
 };
 
 /*
@@ -279,6 +280,11 @@ class JpegR : public UltraHdr {
    * \deprecated This function is deprecated. Use its actual
    */
   status_t getJPEGRInfo(jr_compressed_ptr jpegr_image_ptr, jr_info_ptr jpegr_image_info_ptr);
+
+  uhdr_error_info_t exportAppleGainMap(
+      uhdr_compressed_image_t* input, const uhdr_gainmap_metadata_ext_t* input_metadata,
+      std::unique_ptr<uhdr_compressed_image_ext_t>* output,
+      uhdr_gainmap_metadata_ext_t* output_metadata, unsigned int* width, unsigned int* height);
 
  private:
   uhdr_error_info_t getJPEGRInfo(uhdr_compressed_image_t* uhdr_compressed_img,

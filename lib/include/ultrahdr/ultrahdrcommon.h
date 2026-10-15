@@ -226,6 +226,8 @@ typedef struct uhdr_gainmap_metadata_ext : uhdr_gainmap_metadata {
   }
 
   std::string version;         /**< Ultra HDR format version */
+  bool is_apple_gainmap = false;
+  uint32_t apple_gainmap_version = 0;
 } uhdr_gainmap_metadata_ext_t; /**< alias for struct uhdr_gainmap_metadata */
 
 #ifdef UHDR_ENABLE_GLES
@@ -404,7 +406,7 @@ struct uhdr_decoder_private : uhdr_codec_private {
 
   // internal data
   bool m_probed;
-  bool m_is_jpeg;
+  bool m_is_jpeg = false;
   std::unique_ptr<ultrahdr::uhdr_raw_image_ext_t> m_decoded_img_buffer;
   std::unique_ptr<ultrahdr::uhdr_raw_image_ext_t> m_gainmap_img_buffer;
   int m_img_wd, m_img_ht;
@@ -418,6 +420,11 @@ struct uhdr_decoder_private : uhdr_codec_private {
   std::vector<uint8_t> m_gainmap_img;
   uhdr_mem_block_t m_gainmap_img_block;
   uhdr_gainmap_metadata_t m_metadata;
+  ultrahdr::uhdr_gainmap_metadata_ext_t m_metadata_ext;
+  bool m_gainmap_export_attempted = false;
+  uhdr_error_info_t m_gainmap_export_status = g_no_error;
+  uhdr_gainmap_export_t m_gainmap_export_result{};
+  std::unique_ptr<ultrahdr::uhdr_compressed_image_ext_t> m_gainmap_export_buffer;
   uhdr_error_info_t m_probe_call_status;
   uhdr_error_info_t m_decode_call_status;
 };

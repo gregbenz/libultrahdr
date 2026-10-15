@@ -531,11 +531,14 @@ bool inspect_jpeg_gainmap(const void* data, size_t size) {
   if (jpegr.getJPEGRInfoForProbe(&image, &info).error_code != UHDR_CODEC_OK) return false;
 
   ultrahdr::uhdr_gainmap_metadata_ext_t metadata;
-  return jpegr
-             .parseGainMapMetadata(gainmap.isoData.data(), gainmap.isoData.size(),
-                                   gainmap.xmpData.data(), gainmap.xmpData.size(),
-                                   primary.exifData.data(), primary.exifData.size(), &metadata)
-             .error_code == UHDR_CODEC_OK;
+  if (jpegr
+          .parseGainMapMetadata(gainmap.isoData.data(), gainmap.isoData.size(),
+                                gainmap.xmpData.data(), gainmap.xmpData.size(),
+                                primary.exifData.data(), primary.exifData.size(), &metadata)
+          .error_code != UHDR_CODEC_OK) {
+    return false;
+  }
+  return !metadata.is_apple_gainmap || (gainmap.numComponents == 1 && gainmap.bitDepth == 8);
 }
 
 #ifdef UHDR_ENABLE_HEIF
@@ -1928,6 +1931,9 @@ uhdr_error_info_t uhdr_dec_probe(uhdr_codec_private_t* dec) {
 
   if (!handle->m_probed) {
     handle->m_probed = true;
+    handle->m_is_jpeg = false;
+    handle->m_metadata_ext.is_apple_gainmap = false;
+    handle->m_metadata_ext.apple_gainmap_version = 0;
 
     if (handle->m_uhdr_compressed_img.get() == nullptr) {
       status.error_code = UHDR_CODEC_INVALID_OPERATION;
@@ -2039,6 +2045,15 @@ uhdr_error_info_t uhdr_dec_probe(uhdr_codec_private_t* dec) {
                                         primary_image.exifData.data(),
                                         primary_image.exifData.size(), &metadata);
     if (status.error_code != UHDR_CODEC_OK) return status;
+    if (metadata.is_apple_gainmap &&
+        (gainmap_image.numComponents != 1 || gainmap_image.bitDepth != 8)) {
+      status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+      status.has_detail = 1;
+      snprintf(status.detail, sizeof status.detail,
+               "Apple gain map must be an 8-bit monochrome JPEG");
+      return status;
+    }
+    handle->m_metadata_ext = metadata;
     std::copy(metadata.max_content_boost, metadata.max_content_boost + 3,
               handle->m_metadata.max_content_boost);
     std::copy(metadata.min_content_boost, metadata.min_content_boost + 3,
@@ -2069,6 +2084,7 @@ uhdr_error_info_t uhdr_dec_probe(uhdr_codec_private_t* dec) {
     handle->m_gainmap_img_block.data = handle->m_gainmap_img.data();
     handle->m_gainmap_img_block.data_sz = handle->m_gainmap_img_block.capacity =
         handle->m_gainmap_img.size();
+    handle->m_is_jpeg = true;
   }
 
   return status;
@@ -2191,6 +2207,83 @@ uhdr_gainmap_metadata_t* uhdr_dec_get_gainmap_metadata(uhdr_codec_private_t* dec
   }
 
   return &handle->m_metadata;
+}
+
+uhdr_error_info_t uhdr_dec_export_gainmap(uhdr_codec_private_t* dec,
+                                          uhdr_gainmap_export_t* result) {
+  if (dynamic_cast<uhdr_decoder_private*>(dec) == nullptr || result == nullptr) {
+    uhdr_error_info_t status;
+    status.error_code = UHDR_CODEC_INVALID_PARAM;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail,
+             "received invalid decoder or gain-map export result pointer");
+    return status;
+  }
+
+  uhdr_decoder_private* handle = dynamic_cast<uhdr_decoder_private*>(dec);
+  if (!handle->m_gainmap_export_attempted) {
+    handle->m_gainmap_export_attempted = true;
+    handle->m_gainmap_export_status = uhdr_dec_probe(dec);
+    if (handle->m_gainmap_export_status.error_code == UHDR_CODEC_OK && !handle->m_is_jpeg) {
+      handle->m_gainmap_export_status.error_code = UHDR_CODEC_UNSUPPORTED_FEATURE;
+      handle->m_gainmap_export_status.has_detail = 1;
+      snprintf(handle->m_gainmap_export_status.detail,
+               sizeof handle->m_gainmap_export_status.detail,
+               "gain-map export is supported for JPEG-R inputs only");
+    }
+
+    if (handle->m_gainmap_export_status.error_code == UHDR_CODEC_OK) {
+      uhdr_gainmap_export_t exported{};
+      if (handle->m_metadata_ext.is_apple_gainmap) {
+        ultrahdr::JpegR jpegr;
+        ultrahdr::uhdr_gainmap_metadata_ext_t normalized_metadata;
+        unsigned int width = 0;
+        unsigned int height = 0;
+        handle->m_gainmap_export_status = jpegr.exportAppleGainMap(
+            handle->m_uhdr_compressed_img.get(), &handle->m_metadata_ext,
+            &handle->m_gainmap_export_buffer, &normalized_metadata, &width, &height);
+        if (handle->m_gainmap_export_status.error_code == UHDR_CODEC_OK) {
+          exported.image = *handle->m_gainmap_export_buffer;
+          exported.width = width;
+          exported.height = height;
+          static_cast<uhdr_gainmap_metadata_t&>(exported.metadata) = normalized_metadata;
+        }
+      } else {
+        uhdr_gainmap_metadata_t validated_metadata = handle->m_metadata;
+        handle->m_gainmap_export_status =
+            ultrahdr::uhdr_validate_gainmap_metadata_descriptor(&validated_metadata);
+        if (handle->m_gainmap_export_status.error_code == UHDR_CODEC_OK &&
+            (handle->m_gainmap_img.empty() || handle->m_gainmap_wd <= 0 ||
+             handle->m_gainmap_ht <= 0)) {
+          handle->m_gainmap_export_status.error_code = UHDR_CODEC_INVALID_PARAM;
+          handle->m_gainmap_export_status.has_detail = 1;
+          snprintf(handle->m_gainmap_export_status.detail,
+                   sizeof handle->m_gainmap_export_status.detail,
+                   "parsed gain-map component is empty or has invalid dimensions");
+        }
+        if (handle->m_gainmap_export_status.error_code == UHDR_CODEC_OK) {
+          exported.image.data = handle->m_gainmap_img.data();
+          exported.image.data_sz = handle->m_gainmap_img.size();
+          exported.image.capacity = handle->m_gainmap_img.size();
+          exported.image.cg = UHDR_CG_UNSPECIFIED;
+          exported.image.ct = UHDR_CT_UNSPECIFIED;
+          exported.image.range = UHDR_CR_UNSPECIFIED;
+          exported.metadata = validated_metadata;
+          exported.width = static_cast<unsigned int>(handle->m_gainmap_wd);
+          exported.height = static_cast<unsigned int>(handle->m_gainmap_ht);
+        }
+      }
+
+      if (handle->m_gainmap_export_status.error_code == UHDR_CODEC_OK) {
+        handle->m_gainmap_export_result = exported;
+      }
+    }
+  }
+
+  if (handle->m_gainmap_export_status.error_code == UHDR_CODEC_OK) {
+    *result = handle->m_gainmap_export_result;
+  }
+  return handle->m_gainmap_export_status;
 }
 
 uhdr_error_info_t uhdr_decode(uhdr_codec_private_t* dec) {
@@ -2345,8 +2438,15 @@ void uhdr_reset_decoder(uhdr_codec_private_t* dec) {
 
     // ready to be configured
     handle->m_probed = false;
+    handle->m_is_jpeg = false;
     handle->m_decoded_img_buffer.reset();
     handle->m_gainmap_img_buffer.reset();
+    handle->m_gainmap_export_buffer.reset();
+    handle->m_gainmap_export_result = {};
+    handle->m_gainmap_export_attempted = false;
+    handle->m_gainmap_export_status = g_no_error;
+    handle->m_metadata_ext.is_apple_gainmap = false;
+    handle->m_metadata_ext.apple_gainmap_version = 0;
     handle->m_img_wd = 0;
     handle->m_img_ht = 0;
     handle->m_gainmap_wd = 0;
